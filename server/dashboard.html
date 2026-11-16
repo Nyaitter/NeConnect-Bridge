@@ -72,7 +72,7 @@
   }
   .nui-muted {
     color: var(--nui-muted);
-    margin: 0 0 14px;
+    margin: 0;
     font-size: 14px;
   }
   .nui-btn {
@@ -165,7 +165,6 @@
 
     <section class="nui-card" id="loginCard" style="display:none;">
       <h1>ダッシュボード</h1>
-      <p class="nui-muted">登録したブリッジURLの状態や使用回数を確認するには、Nyaitter でサインインしてください。</p>
       <a class="nui-btn" href="/bridge/auth/login">Nyaitter でサインイン</a>
     </section>
 
@@ -173,7 +172,7 @@
       <section class="nui-card">
         <h1 id="userTitle">ダッシュボード</h1>
         <div class="nui-row">
-          <input class="nui-code" id="regInput" type="text" placeholder="https://example.com/bridge/server">
+          <input class="nui-code" id="regInput" type="text" placeholder="https://example.com/bridge/server" aria-label="ブリッジURL">
           <button class="nui-btn" id="regBtn" onclick="regBridge()">登録</button>
         </div>
         <div class="nui-note" id="regOut"></div>
@@ -205,7 +204,7 @@
       const data = await res.json();
       const area = document.getElementById("listArea");
       if (!data.items || data.items.length === 0) {
-        area.innerHTML = '<p class="nui-muted">登録されているブリッジURLはありません。</p>';
+        area.innerHTML = '<p class="nui-muted">登録されているブリッジURLはありません</p>';
         return;
       }
       area.innerHTML = "";
@@ -248,7 +247,7 @@
       const url = input.value.trim();
       if (!url) return;
       btn.disabled = true;
-      out.textContent = "確認して登録しています...";
+      out.textContent = "登録しています...";
       try {
         const res = await fetch("/bridge/register", {
           method: "POST",

@@ -439,23 +439,23 @@ function html(res, body) {
 
 function normalizeBridgeURL(raw) {
   let value = String(raw || '').trim();
-  if (!value) throw new Error('URLを入力してください');
+  if (!value) throw new Error('ブリッジURLを入力してください');
   if (!value.includes('://')) value = `https://${value}`;
   if (!/^(https?|ssh):\/\//.test(value)) {
-    throw new Error('https:// / http:// / ssh:// のURLのみ登録できます');
+    throw new Error('https で始まるURLを入力してください');
   }
   return value;
 }
 
 async function verifyBridgeURL(raw) {
-  if (raw.startsWith('ssh://')) throw new Error('https:// のブリッジURLのみ登録できます');
+  if (raw.startsWith('ssh://')) throw new Error('https で始まるURLを入力してください');
   let parsed;
   try {
     parsed = new URL(raw);
   } catch {
-    throw new Error('URLが不正です');
+    throw new Error('URLの形式が正しくありません');
   }
-  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') throw new Error('URLが不正です');
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') throw new Error('URLの形式が正しくありません');
   const challenge = randomURLSafe(16);
   parsed.searchParams.set('challenge', challenge);
   let response;
@@ -467,16 +467,16 @@ async function verifyBridgeURL(raw) {
   } catch {
     throw new Error('サーバーへ接続できませんでした');
   }
-  if (response.status !== 200) throw new Error('応答チェックに失敗しました');
+  if (response.status !== 200) throw new Error('ブリッジURLを確認できませんでした');
   let result;
   try {
     result = await response.json();
   } catch {
-    throw new Error('応答の形式が不正です');
+    throw new Error('ブリッジURLを確認できませんでした');
   }
   const expected = challengeProof(challenge);
   if (result.service !== 'NeConnect Bridge Server' || result.status !== 'ok' || result.proof !== expected) {
-    throw new Error('公式ブリッジへの整合性チェックを通過できませんでした');
+    throw new Error('このブリッジURLは登録できません');
   }
 }
 
