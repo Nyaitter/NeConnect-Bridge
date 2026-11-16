@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="ja" data-nui-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NeConnect Bridge</title>
+<style>
+  :where(:root) {
+    --nui-accent: #ff9900;
+    --nui-accent-hover: #e88b00;
+    --nui-accent-on: #1f1f1f;
+    --nui-border: #eff3f4;
+    --nui-bg: #ffffff;
+    --nui-surface: #f9f9f9;
+    --nui-text: #0f1419;
+    --nui-muted: #536471;
+    --nui-radius-sm: 8px;
+    --nui-radius: 12px;
+    --nui-radius-pill: 9999px;
+    --nui-shadow: 0 1px 2px rgb(15 20 25 / 5%);
+    --nui-font: "Noto Sans JP", system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    [data-nui-theme="auto"] {
+      --nui-border: #2f363d;
+      --nui-bg: #1c1d21;
+      --nui-surface: #18191d;
+      --nui-text: #ffffff;
+      --nui-muted: #c9ccd1;
+      --nui-shadow: 0 1px 2px rgb(0 0 0 / 35%);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--nui-bg);
+    color: var(--nui-text);
+    font-family: var(--nui-font);
+    line-height: 1.6;
+  }
+  .nui-wrap {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 36px 20px 64px;
+  }
+  .nui-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 28px;
+  }
+  .nui-brand {
+    font-size: 20px;
+    font-weight: 700;
+  }
+  .nui-card {
+    background: var(--nui-surface);
+    border: 1px solid var(--nui-border);
+    border-radius: var(--nui-radius);
+    box-shadow: var(--nui-shadow);
+    padding: 24px;
+    margin-bottom: 16px;
+  }
+  .nui-card h1 {
+    margin: 0 0 8px;
+    font-size: 24px;
+  }
+  .nui-card h2 {
+    margin: 0 0 12px;
+    font-size: 17px;
+  }
+  .nui-muted {
+    color: var(--nui-muted);
+    margin: 0 0 18px;
+    font-size: 14.5px;
+  }
+  .nui-btn {
+    display: inline-block;
+    background: var(--nui-accent);
+    color: var(--nui-accent-on);
+    text-decoration: none;
+    font-weight: 700;
+    font-size: 14.5px;
+    padding: 10px 20px;
+    border-radius: var(--nui-radius-pill);
+    border: none;
+    cursor: pointer;
+  }
+  .nui-btn:hover { background: var(--nui-accent-hover); }
+  .nui-btn-sub {
+    background: var(--nui-bg);
+    color: var(--nui-text);
+    border: 1px solid var(--nui-border);
+    font-weight: 600;
+    font-size: 14px;
+    padding: 9px 16px;
+    border-radius: var(--nui-radius-pill);
+    cursor: pointer;
+  }
+  .nui-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .nui-code {
+    flex: 1;
+    min-width: 220px;
+    background: var(--nui-bg);
+    border: 1px solid var(--nui-border);
+    border-radius: var(--nui-radius-sm);
+    padding: 10px 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+    word-break: break-all;
+  }
+  select.nui-code {
+    flex: 0 0 auto;
+    min-width: 150px;
+    color: var(--nui-text);
+  }
+  .nui-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .nui-grid .nui-card {
+    margin-bottom: 0;
+    padding: 16px;
+  }
+  .nui-grid h3 {
+    margin: 0 0 6px;
+    font-size: 15px;
+  }
+  .nui-grid p {
+    margin: 0;
+    font-size: 13.5px;
+    color: var(--nui-muted);
+  }
+  ol {
+    margin: 0;
+    padding-left: 20px;
+    font-size: 14.5px;
+  }
+  li { margin-bottom: 6px; }
+  pre {
+    margin: 10px 0 0;
+    background: var(--nui-bg);
+    border: 1px solid var(--nui-border);
+    border-radius: var(--nui-radius-sm);
+    padding: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    overflow-x: auto;
+  }
+  .nui-note {
+    margin-top: 10px;
+    font-size: 13px;
+    color: var(--nui-muted);
+  }
+</style>
+</head>
+<body class="nui-root">
+  <div class="nui-wrap">
+    <header class="nui-header">
+      <div class="nui-brand">NeConnect Bridge</div>
+      <a class="nui-btn-sub" href="/bridge/dashboard" style="text-decoration:none;">ダッシュボード</a>
+    </header>
+
+    <section class="nui-card">
+      <h1>NeConnect Bridge</h1>
+      <p class="nui-muted">いつものブラウザを、つながりにくい場所からでも使えるようにする小さな中継ツールです。</p>
+      <div class="nui-row">
+        <select class="nui-code" id="version" aria-label="バージョン"></select>
+        <a class="nui-btn" id="download" href="/bridge/download">NeConnectBridge.exe をダウンロード</a>
+      </div>
+      <div class="nui-note" id="versionNote"></div>
+    </section>
+
+    <div class="nui-grid">
+      <div class="nui-card">
+        <h3>オート</h3>
+        <p>速い順に接続を試します。</p>
+      </div>
+      <div class="nui-card">
+        <h3>スピード</h3>
+        <p>速度を優先して接続します。</p>
+      </div>
+      <div class="nui-card">
+        <h3>バランス</h3>
+        <p>安定性と速度を両立します。</p>
+      </div>
+      <div class="nui-card">
+        <h3>セキュア</h3>
+        <p>つながりにくい環境向けに接続します。</p>
+      </div>
+    </div>
+
+    <section class="nui-card">
+      <h2>起動できるもの</h2>
+      <div class="nui-grid">
+        <div class="nui-card">
+          <h3>Chrome</h3>
+          <p>入っている Chrome を専用の設定で開きます。</p>
+        </div>
+        <div class="nui-card">
+          <h3>Edge</h3>
+          <p>入っている Edge を専用の設定で開きます。</p>
+        </div>
+        <div class="nui-card">
+          <h3>NCTB Browser</h3>
+          <p>専用の軽量ブラウザを自動で用意して開きます。</p>
+        </div>
+        <div class="nui-card">
+          <h3>NCTB Bash</h3>
+          <p>専用のシェルを別ウィンドウで開きます。</p>
+        </div>
+        <div class="nui-card">
+          <h3>任意のアプリケーション</h3>
+          <p>指定したアプリを中継経由で起動します。</p>
+        </div>
+      </div>
+      <div class="nui-note">Connect はつなぐだけ、Launch はアプリを開くだけ。役割は分かれています。</div>
+    </section>
+
+    <section class="nui-card">
+      <h2>ブリッジURL</h2>
+      <div class="nui-row">
+        <div class="nui-code" id="ep"></div>
+        <button class="nui-btn-sub" onclick="copyEP()">コピー</button>
+        <button class="nui-btn-sub" id="genBtn" onclick="reqBridge()">ブリッジURLをリクエスト</button>
+      </div>
+      <div class="nui-note" id="genOut"></div>
+    </section>
+
+    <section class="nui-card">
+      <h2>使い方</h2>
+      <ol>
+        <li>NeConnectBridge.exe をダウンロードして起動します。</li>
+        <li>使うブリッジURLを上から順に並べ、接続方法を選んで Connect を押します。</li>
+        <li>起動対象を選んで Launch を押すと、中継経由でアプリが開きます。</li>
+        <li>よく使うアプリは「ショートカットを作成」から好きな場所に保存できます。</li>
+        <li>アプリをウインドウへドラッグすると、そのアプリが起動対象に入ります。</li>
+        <li>困ったときは「ログ」を押すと動きの記録を確認できます。</li>
+      </ol>
+    </section>
+
+    <section class="nui-card">
+      <h2>協力する</h2>
+      <p class="nui-muted">自分の Linux 環境で中継を起動し、公開URLを登録すると、ほかの人がそのURLを使えるようになります。</p>
+      <pre id="relayCmd"></pre>
+      <div id="regLoginBox" style="margin-top:14px;display:none;"><a class="nui-btn" href="/bridge/auth/login">Nyaitter でサインインして登録</a></div>
+      <div class="nui-row" id="regFormBox" style="margin-top:14px;display:none;">
+        <input class="nui-code" id="regInput" type="text" placeholder="https://example.com/bridge/server">
+        <button class="nui-btn-sub" id="regBtn" onclick="regBridge()">登録</button>
+      </div>
+      <div class="nui-note" id="regOut"></div>
+    </section>
+  </div>
+
+  <script>
+    const origin = location.origin;
+    const epEl = document.getElementById("ep");
+    epEl.textContent = origin + "/bridge/server";
+    document.getElementById("relayCmd").textContent =
+      "curl -L " + origin + "/bridge/server-bin -o nctb-server\nchmod +x nctb-server\n./nctb-server --relay --listen :8090";
+
+    fetch("/bridge/auth/me").then(r => r.json()).then(d => {
+      document.getElementById(d.logged_in ? "regFormBox" : "regLoginBox").style.display = d.logged_in ? "flex" : "block";
+    }).catch(() => { document.getElementById("regLoginBox").style.display = "block"; });
+
+    const versionEl = document.getElementById("version");
+    const downloadEl = document.getElementById("download");
+    const versionNote = document.getElementById("versionNote");
+
+    function applyVersion() {
+      const value = versionEl.value;
+      downloadEl.href = value ? "/bridge/download?version=" + encodeURIComponent(value) : "/bridge/download";
+    }
+
+    fetch("/bridge/versions").then(r => r.json()).then(data => {
+      const versions = data.versions || [];
+      versionEl.innerHTML = "";
+      if (versions.length === 0) {
+        versionNote.textContent = "配布中のバージョンはありません。";
+        versionEl.disabled = true;
+        return;
+      }
+      versions.forEach((item, index) => {
+        const option = document.createElement("option");
+        option.value = item.version;
+        option.textContent = index === 0 ? item.version + " 最新" : item.version;
+        versionEl.appendChild(option);
+      });
+      versionEl.value = data.latest || versions[0].version;
+      applyVersion();
+    }).catch(() => {
+      versionNote.textContent = "バージョンを読み込めませんでした。";
+    });
+
+    versionEl.addEventListener("change", applyVersion);
+
+    function copyEP() {
+      navigator.clipboard.writeText(epEl.textContent);
+      document.getElementById("genOut").textContent = "コピーしました";
+    }
+
+    function getCID() {
+      let id = localStorage.getItem("nctb_cid");
+      if (!id) {
+        id = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36));
+        localStorage.setItem("nctb_cid", id);
+      }
+      return id;
+    }
+
+    async function reqBridge() {
+      const btn = document.getElementById("genBtn");
+      const out = document.getElementById("genOut");
+      btn.disabled = true;
+      out.textContent = "リクエストしています...";
+      try {
+        const res = await fetch("/bridge/generate?cid=" + encodeURIComponent(getCID()));
+        const data = await res.json();
+        if (data.ok && data.url) {
+          epEl.textContent = data.url;
+          out.textContent = "取得しました";
+        } else {
+          out.textContent = "取得できませんでした";
+        }
+      } catch (e) {
+        out.textContent = "取得できませんでした";
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function regBridge() {
+      const input = document.getElementById("regInput");
+      const btn = document.getElementById("regBtn");
+      const out = document.getElementById("regOut");
+      const url = input.value.trim();
+      if (!url) return;
+      btn.disabled = true;
+      out.textContent = "確認して登録しています...";
+      try {
+        const res = await fetch("/bridge/register", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({url})
+        });
+        const data = await res.json();
+        if (data.ok) {
+          input.value = "";
+          out.textContent = "登録しました";
+        } else {
+          out.textContent = data.error || "登録できませんでした";
+        }
+      } catch (e) {
+        out.textContent = "登録できませんでした";
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
