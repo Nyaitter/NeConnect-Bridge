@@ -40,10 +40,8 @@ var obfsKey = sha256.Sum256([]byte(obfsPassphrase))
 
 const (
 	officialSSHHostKeyLine = ""
-	defaultServerURL = "https://bridge.example.com/bridge/server"
-	defaultSSHHost   = "bridge.example.com:22"
-	defaultObfsHost  = "bridge.example.com:8443"
-	browserUA        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	defaultServerURL       = "https://bridge.example.com/bridge/server"
+	browserUA              = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
 type Config struct {
@@ -52,11 +50,7 @@ type Config struct {
 	ModeIdx   int    `json:"mode_idx"`
 	TargetIdx int    `json:"target_idx"`
 	AppPath   string `json:"app_path"`
-}
-
-type serverMeta struct {
-	SSHHost  string `json:"ssh_host"`
-	ObfsHost string `json:"obfs_host"`
+	URLSet    int    `json:"url_set"`
 }
 
 var (
@@ -102,7 +96,10 @@ func exeDir() string {
 	return filepath.Dir(p)
 }
 
-const defaultMultiURLs = "https://bridge.example.com/bridge/server\nssh://bridge.example.com:22"
+const defaultMultiURLs = "https://bridge.example.com/bridge/server"
+
+// urlSetVersion はブリッジURLの初期一覧を更新したときに上げる。
+const urlSetVersion = 2
 
 func loadConfig(dir string) Config {
 	cfg := Config{
@@ -125,6 +122,12 @@ func loadConfig(dir string) Config {
 	if strings.TrimSpace(cfg.ServerURL) == "" {
 		cfg.ServerURL = defaultMultiURLs
 	}
+	// 前の版が保存した接続先はそのまま使わず、今の一覧へ入れ替える。
+	if cfg.URLSet < urlSetVersion {
+		cfg.ServerURL = defaultMultiURLs
+		cfg.URLSet = urlSetVersion
+		saveConfig(dir, cfg)
+	}
 	if cfg.TargetIdx < 0 || cfg.TargetIdx > targetApp {
 		cfg.TargetIdx = targetBrowser
 	}
@@ -146,6 +149,10 @@ func splitServerURLs(raw string) []string {
 	for _, line := range strings.Split(raw, "\n") {
 		s := strings.TrimSpace(line)
 		if s == "" || seen[s] {
+			continue
+		}
+		// 直結の指定は使わず、ブリッジURLだけを扱う。
+		if strings.HasPrefix(strings.ToLower(s), "ssh://") {
 			continue
 		}
 		seen[s] = true
@@ -223,7 +230,10 @@ func resolveDoH(host string) (string, error) {
 				if ans.Type == 1 && net.ParseIP(ans.Data) != nil {
 					logf("DoH resolved %s -> %s", host, ans.Data)
 					dohMu.Lock()
-					dohCache[host] = struct{ ip string; exp time.Time }{ans.Data, time.Now().Add(10 * time.Minute)}
+					dohCache[host] = struct {
+						ip  string
+						exp time.Time
+					}{ans.Data, time.Now().Add(10 * time.Minute)}
 					dohMu.Unlock()
 					return ans.Data, nil
 				}
@@ -459,40 +469,11 @@ func toWSURL(rawURL, mode string) (string, string, error) {
 	return u.String(), httpURL, nil
 }
 
-func fetchMeta(httpURL string) serverMeta {
-	meta := serverMeta{SSHHost: defaultSSHHost, ObfsHost: defaultObfsHost}
-	hc := makeDoHHTTPClient(4 * time.Second)
-	req, err := http.NewRequest("GET", httpURL, nil)
-	if err != nil {
-		return meta
-	}
-	req.Header.Set("User-Agent", browserUA)
-	resp, err := hc.Do(req)
-	if err != nil {
-		logf("fetchMeta failed (%s): %v (using defaults)", httpURL, err)
-		return meta
-	}
-	defer resp.Body.Close()
-	var parsed serverMeta
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err == nil {
-		if parsed.SSHHost != "" {
-			meta.SSHHost = parsed.SSHHost
-		}
-		if parsed.ObfsHost != "" {
-			meta.ObfsHost = parsed.ObfsHost
-		}
-		logf("fetchMeta ok: ssh_host=%s obfs_host=%s", meta.SSHHost, meta.ObfsHost)
-	}
-	return meta
-}
-
 type bridgeEngine struct {
 	mode      string
 	methods   []connMethod
 	wsBase    string
 	pollURL   string
-	sshHost   string
-	obfsHost  string
 	sshCfg    *ssh.ClientConfig
 	dialer    *websocket.Dialer
 	dohDialer *websocket.Dialer
@@ -507,15 +488,12 @@ type methodKind int
 
 const (
 	methodWSPool methodKind = iota
-	methodSSHDirect
-	methodObfsSSH
 	methodWSTunnel
 	methodDoHWS
 	methodHTTPPoll
 	methodCFDirectWS
 	methodCFDirectPoll
 	methodTLSFrag
-	methodFakeTLS
 	methodAltPorts
 	methodSSEForm
 	methodAssetCookie
@@ -530,15 +508,12 @@ type connMethod struct {
 // 各モードはこの一覧の範囲を選ぶだけで、個別の処理は持たない。
 var connectionMethods = []connMethod{
 	{"wsPool", methodWSPool},
-	{"sshDirect", methodSSHDirect},
-	{"obfsSSH", methodObfsSSH},
 	{"wsTunnel", methodWSTunnel},
 	{"dohWS", methodDoHWS},
 	{"httpPoll", methodHTTPPoll},
 	{"cfDirectWS", methodCFDirectWS},
 	{"cfDirectPoll", methodCFDirectPoll},
 	{"tlsFrag", methodTLSFrag},
-	{"fakeTLS", methodFakeTLS},
 	{"altPorts", methodAltPorts},
 	{"sseForm", methodSSEForm},
 	{"assetCookie", methodAssetCookie},
@@ -576,15 +551,13 @@ func officialHostKeyCallback() ssh.HostKeyCallback {
 	return ssh.FixedHostKey(pk)
 }
 
-func newBridgeEngine(mode, wsBase, pollURL, sshHost, obfsHost string, signer ssh.Signer) (*bridgeEngine, error) {
+func newBridgeEngine(mode, wsBase, pollURL string, signer ssh.Signer) (*bridgeEngine, error) {
 	netDialer := &net.Dialer{Timeout: 6 * time.Second}
 	e := &bridgeEngine{
-		mode:     mode,
-		methods:  methodsForMode(mode),
-		wsBase:   wsBase,
-		pollURL:  pollURL,
-		sshHost:  sshHost,
-		obfsHost: obfsHost,
+		mode:    mode,
+		methods: methodsForMode(mode),
+		wsBase:  wsBase,
+		pollURL: pollURL,
 		sshCfg: &ssh.ClientConfig{
 			User:              "ubuntu",
 			Auth:              []ssh.AuthMethod{ssh.PublicKeys(signer)},
@@ -593,14 +566,14 @@ func newBridgeEngine(mode, wsBase, pollURL, sshHost, obfsHost string, signer ssh
 			Timeout:           8 * time.Second,
 		},
 		dialer: &websocket.Dialer{
-			Proxy:            proxyFunc,
-			HandshakeTimeout: 8 * time.Second,
+			Proxy:             proxyFunc,
+			HandshakeTimeout:  8 * time.Second,
 			ReadBufferSize:    128 * 1024,
 			WriteBufferSize:   128 * 1024,
 			EnableCompression: false,
 		},
 		dohDialer: &websocket.Dialer{
-			HandshakeTimeout: 8 * time.Second,
+			HandshakeTimeout:  8 * time.Second,
 			ReadBufferSize:    128 * 1024,
 			WriteBufferSize:   128 * 1024,
 			EnableCompression: false,
@@ -745,11 +718,8 @@ func (e *bridgeEngine) tryObfsSSH(name string, dialFn func() (net.Conn, error)) 
 		return nil, err
 	}
 	_ = raw.SetDeadline(time.Time{})
-	sshAddr := e.sshHost
-	if sshAddr == "" {
-		sshAddr = defaultSSHHost
-	}
-	c, chans, reqs, err := ssh.NewClientConn(obfsConn, sshAddr, e.sshCfg)
+	// SSHはトンネルの中を通るので、接続先の名前は固定で構わない。
+	c, chans, reqs, err := ssh.NewClientConn(obfsConn, "bridge", e.sshCfg)
 	if err != nil {
 		_ = obfsConn.Close()
 		logf("[%s] ssh handshake failed: %v", name, err)
@@ -771,19 +741,6 @@ func (e *bridgeEngine) dialTCPNoDelay(addr string, timeout time.Duration) (net.C
 	return conn, err
 }
 
-func (e *bridgeEngine) dialSSHDirect(addr string) (*ssh.Client, error) {
-	conn, err := e.dialTCPNoDelay(addr, 6*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	c, chans, reqs, err := ssh.NewClientConn(conn, addr, e.sshCfg)
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	return ssh.NewClient(c, chans, reqs), nil
-}
-
 func (e *bridgeEngine) dialSSHTransport() (*ssh.Client, error) {
 	var errs []string
 	for _, m := range e.methods {
@@ -801,11 +758,6 @@ func (e *bridgeEngine) dialSSHTransport() (*ssh.Client, error) {
 
 func (e *bridgeEngine) dialMethod(m connMethod) (*ssh.Client, error) {
 	switch m.kind {
-	case methodSSHDirect:
-		logf("[%s] dialing SSH %s", m.name, e.sshHost)
-		return e.dialSSHDirect(e.sshHost)
-	case methodObfsSSH:
-		return e.dialObfsRace(m.name)
 	case methodWSTunnel:
 		return e.tryObfsSSH(m.name, func() (net.Conn, error) {
 			return e.dialRawWS("secure", false)
@@ -826,8 +778,6 @@ func (e *bridgeEngine) dialMethod(m connMethod) (*ssh.Client, error) {
 		return e.tryObfsSSH(m.name, func() (net.Conn, error) {
 			return e.dialFragWS()
 		})
-	case methodFakeTLS:
-		return e.dialFakeTLS(m.name)
 	case methodAltPorts:
 		return e.dialAltPorts(m.name)
 	case methodSSEForm:
@@ -837,7 +787,6 @@ func (e *bridgeEngine) dialMethod(m connMethod) (*ssh.Client, error) {
 	}
 	return nil, fmt.Errorf("unsupported method: %s", m.name)
 }
-
 
 func (e *bridgeEngine) origin() (string, error) {
 	u, err := url.Parse(e.wsBase)
@@ -887,15 +836,6 @@ func (e *bridgeEngine) dialFragWS() (net.Conn, error) {
 	return wsconn.Wrap(ws), nil
 }
 
-func (e *bridgeEngine) dialFakeTLS(name string) (*ssh.Client, error) {
-	if e.obfsHost == "" {
-		return nil, errors.New("obfs host is empty")
-	}
-	return e.tryObfsSSH(name, func() (net.Conn, error) {
-		return covert.DialFakeTLS(e.obfsHost, 4*time.Second)
-	})
-}
-
 func (e *bridgeEngine) dialAltPorts(name string) (*ssh.Client, error) {
 	if e.wsBase == "" {
 		return nil, errors.New("bridge url is empty")
@@ -940,53 +880,6 @@ func (e *bridgeEngine) dialAssetCookie(name string) (*ssh.Client, error) {
 	return e.tryObfsSSH(name, func() (net.Conn, error) {
 		return covert.DialAsset(origin, makeDoHHTTPClient(40*time.Second))
 	})
-}
-
-func (e *bridgeEngine) dialObfsRace(name string) (*ssh.Client, error) {
-	if e.obfsHost == "" {
-		return nil, errors.New("obfs host is empty")
-	}
-	host, _, _ := net.SplitHostPort(e.obfsHost)
-	cands := []string{e.obfsHost}
-	if host != "" {
-		for _, p := range []string{"443", "8443", "8080", "2222"} {
-			cand := net.JoinHostPort(host, p)
-			if cand != e.obfsHost {
-				cands = append(cands, cand)
-			}
-		}
-	}
-	type raceRes struct {
-		client *ssh.Client
-		label  string
-		err    error
-	}
-	resCh := make(chan raceRes, len(cands))
-	for _, tgt := range cands {
-		target := tgt
-		go func() {
-			c, err := e.tryObfsSSH(name+":"+target, func() (net.Conn, error) {
-				return e.dialTCPNoDelay(target, 1800*time.Millisecond)
-			})
-			resCh <- raceRes{c, target, err}
-		}()
-	}
-	var winner *ssh.Client
-	var errs []string
-	for i := 0; i < len(cands); i++ {
-		r := <-resCh
-		if r.err == nil && winner == nil {
-			winner = r.client
-		} else if r.client != nil {
-			_ = r.client.Close()
-		} else if r.err != nil {
-			errs = append(errs, r.label+": "+r.err.Error())
-		}
-	}
-	if winner != nil {
-		return winner, nil
-	}
-	return nil, errors.New(strings.Join(errs, "\n"))
 }
 
 func (e *bridgeEngine) dialCFDirectWS(name string) (*ssh.Client, error) {
@@ -1278,13 +1171,13 @@ func serveSOCKS5(ln net.Listener, eng *bridgeEngine) {
 			_ = tc.SetNoDelay(true)
 		}
 		go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				logf("socks connection stopped: %v", r)
-			}
+			defer func() {
+				if r := recover(); r != nil {
+					logf("socks connection stopped: %v", r)
+				}
+			}()
+			handleSOCKS5(conn, eng)
 		}()
-		handleSOCKS5(conn, eng)
-	}()
 	}
 }
 
@@ -1770,25 +1663,15 @@ func generateURLImpl(dir string, cfg Config, signer ssh.Signer, currentURLs stri
 	for _, raw := range cands {
 		var httpURL string
 		var pollURL string
-		sshHost := defaultSSHHost
-		obfsHost := defaultObfsHost
-		if strings.HasPrefix(raw, "ssh://") {
-			sshHost = strings.TrimPrefix(raw, "ssh://")
-			if !strings.Contains(sshHost, ":") {
-				sshHost += ":22"
-			}
-		} else {
-			var uerr error
-			_, httpURL, uerr = toWSURL(raw, "secure")
-			if uerr == nil {
-				pollURL = strings.TrimSuffix(httpURL, "/server") + "/poll"
-				meta := fetchMeta(httpURL)
-				sshHost = meta.SSHHost
-				obfsHost = meta.ObfsHost
-			}
+		var uerr error
+		_, httpURL, uerr = toWSURL(raw, "secure")
+		if uerr != nil {
+			errs = append(errs, "bridge("+raw+"): "+uerr.Error())
+			continue
 		}
+		pollURL = strings.TrimSuffix(httpURL, "/server") + "/poll"
 		logf("Connecting to bridge (%s) to generate URL...", raw)
-		eng, cerr := newBridgeEngine("secure", httpURL, pollURL, sshHost, obfsHost, signer)
+		eng, cerr := newBridgeEngine("secure", httpURL, pollURL, signer)
 		if cerr != nil {
 			errs = append(errs, "bridge("+raw+"): "+cerr.Error())
 			continue

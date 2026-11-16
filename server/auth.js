@@ -129,13 +129,20 @@ class Auth {
     return result.auth_url;
   }
 
-  async exchange(state, code) {
+  async exchange(state, code, req) {
     const verifier = this.takePending(state);
     if (!verifier || !code) throw new Error('invalid callback');
+    const body = {
+      app_id: this.config.authAppId,
+      api_token: this.appToken,
+      code,
+      code_verifier: verifier,
+    };
+    if (req) body.redirect_uri = this.redirectURI(req);
     const response = await fetch(`${this.config.authApi}/token`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'user-agent': 'NeConnectBridge/1.0' },
-      body: JSON.stringify({ code, code_verifier: verifier }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(8000),
     });
     const result = await response.json().catch(() => ({}));

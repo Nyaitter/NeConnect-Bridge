@@ -496,8 +496,6 @@ const server = http.createServer(async (req, res) => {
       const payload = {
         service: 'NeConnect Bridge Server',
         status: 'ok',
-        ssh_host: config.sshHost,
-        obfs_host: config.obfsHost,
         modes: ['secure', 'balance', 'speed'],
       };
       const challenge = (url.searchParams.get('challenge') || '').trim();
@@ -622,7 +620,7 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/bridge/auth/callback') {
       try {
-        const user = await auth.exchange(url.searchParams.get('state') || '', url.searchParams.get('code') || '');
+        const user = await auth.exchange(url.searchParams.get('state') || '', url.searchParams.get('code') || '', req);
         const cookie = [
           `nctb_session=${auth.signSession(user)}`,
           'Path=/',
