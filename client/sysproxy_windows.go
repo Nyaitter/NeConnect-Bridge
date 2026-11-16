@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows/registry"
@@ -40,10 +39,6 @@ type processEntry32W struct {
 	szExeFile           [260]uint16
 }
 
-func isProcessRunning(exePath string) bool {
-	return countProcesses(exePath) > 0
-}
-
 func countProcesses(exePath string) int {
 	target := strings.ToLower(filepath.Base(exePath))
 	if target == "" {
@@ -67,23 +62,6 @@ func countProcesses(exePath string) int {
 		ret, _, _ = procProcess32NextW.Call(snap, uintptr(unsafe.Pointer(&pe)))
 	}
 	return count
-}
-
-// 既存のプロファイルで起動した場合に、同じブラウザがすべて閉じられたかを監視する。
-// Disconnect などで discCh が閉じられたら即座に止める。
-func watchBrowserClose(exePath string, discCh chan struct{}) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-discCh:
-			return
-		case <-ticker.C:
-			if countProcesses(exePath) == 0 {
-				return
-			}
-		}
-	}
 }
 
 type sysProxyBackup struct {

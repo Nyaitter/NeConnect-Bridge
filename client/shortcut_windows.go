@@ -25,7 +25,6 @@ var (
 	procGetSaveFileNameW     = comdlg.NewProc("GetSaveFileNameW")
 	procGetOpenFileNameW     = comdlg.NewProc("GetOpenFileNameW")
 	procSHGetFileInfoW       = shell32.NewProc("SHGetFileInfoW")
-	procShellExecuteW        = shell32.NewProc("ShellExecuteW")
 )
 
 type guid struct {
@@ -319,13 +318,6 @@ func pickShortcutPath(owner uintptr, defaultName string) (string, bool) {
 		return "", false
 	}
 	return syscall.UTF16ToString(buf), true
-}
-
-// openPath は指定のフォルダをエクスプローラで開く。
-func openFolder(path string) {
-	p := comString(path)
-	procShellExecuteW.Call(0, uintptr(unsafe.Pointer(comString("open"))), uintptr(unsafe.Pointer(p)), 0, 0, 1)
-	runtime.KeepAlive(p)
 }
 
 // resolveDroppedPath はドロップされたパスから実行ファイルを取り出す。

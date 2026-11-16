@@ -59,6 +59,7 @@ const pool = new BridgePool(config.bridgesFile, config.maxClients);
 const releases = new ReleaseStore({
   releasesDir: config.releasesDir,
   fallbackExe: config.clientExe,
+  fallbackVersion: config.clientVersion,
 });
 const auth = new Auth(config);
 const tunnels = new TunnelManager({ listenPort: config.listenPort });
@@ -75,6 +76,8 @@ function loadAdminToken() {
 }
 const adminToken = loadAdminToken();
 
+let obfsServerRef = null;
+
 function challengeProof(challenge) {
   return crypto.createHmac('sha256', auth.secret).update(`nctb-verify:${challenge}`).digest('hex');
 }
@@ -83,6 +86,13 @@ function parseAddress(value) {
   const idx = value.lastIndexOf(':');
   if (idx < 0) return { host: value, port: 0 };
   return { host: value.slice(0, idx), port: Number(value.slice(idx + 1)) };
+}
+
+class RequestError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
 }
 
 function connect(address, timeoutMs) {
@@ -152,9 +162,20 @@ async function handleStream(stream, highSpeed) {
 
 const tunnelSessions = new Map();
 
+const MAX_TUNNEL_SESSIONS = 2048;
+
+function pruneTunnelSessions() {
+  if (tunnelSessions.size <= MAX_TUNNEL_SESSIONS) return;
+  for (const [key, pipe] of tunnelSessions) {
+    if (tunnelSessions.size <= MAX_TUNNEL_SESSIONS) break;
+    if (pipe.closed) tunnelSessions.delete(key);
+  }
+}
+
 function openTunnel(sid, tag) {
   let pipe = tunnelSessions.get(sid);
   if (pipe) return pipe;
+  pruneTunnelSessions();
   pipe = new TunnelPipe(sid);
   tunnelSessions.set(sid, pipe);
   pipe.stream.on('close', () => {
@@ -222,18 +243,49 @@ function readBody(req, limit) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    let settled = false;
     req.on('data', (chunk) => {
+      if (settled) return;
       size += chunk.length;
       if (size > limit) {
-        reject(new Error('body too large'));
-        req.destroy();
+        settled = true;
+        reject(new RequestError(413, 'body too large'));
+        req.pause();
         return;
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks));
+    });
+    req.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+    req.on('aborted', () => {
+      if (settled) return;
+      settled = true;
+      reject(new RequestError(400, 'request aborted'));
+    });
   });
+}
+
+async function readJSON(req, limit) {
+  const body = await readBody(req, limit);
+  const text = body.toString('utf8').trim();
+  if (text === '') return {};
+  try {
+    const value = JSON.parse(text);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('object expected');
+    }
+    return value;
+  } catch {
+    throw new RequestError(400, '入力が不正です');
+  }
 }
 
 
@@ -530,13 +582,7 @@ const server = http.createServer(async (req, res) => {
         json(res, 401, { ok: false, error: 'Nyaitter でサインインしてください' });
         return;
       }
-      let body;
-      try {
-        body = JSON.parse((await readBody(req, 4096)).toString('utf8') || '{}');
-      } catch {
-        json(res, 400, { ok: false, error: '入力が不正です' });
-        return;
-      }
+      const body = await readJSON(req, 4096);
       let normalized;
       try {
         normalized = normalizeBridgeURL(body.url);
@@ -608,15 +654,12 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' }).end('unauthorized');
         return;
       }
-      const items = pool
-        .list()
-        .filter((_, index) => pool.entries[index].owner_id === user.id)
-        .map((entry) => ({
-          url: entry.url,
-          used: entry.used,
-          max: entry.max,
-          active: entry.used < entry.max,
-        }));
+      const items = pool.listOwned(user.id).map((entry) => ({
+        url: entry.url,
+        used: entry.used,
+        max: entry.max,
+        active: entry.used < entry.max,
+      }));
       json(res, 200, { items });
       return;
     }
@@ -627,7 +670,7 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' }).end('unauthorized');
         return;
       }
-      const body = JSON.parse((await readBody(req, 4096)).toString('utf8') || '{}');
+      const body = await readJSON(req, 4096);
       pool.removeOwned(String(body.url || ''), user.id);
       json(res, 200, { ok: true });
       return;
@@ -651,7 +694,7 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/bridge/api/admin/add') {
       if (!requireAdmin(req, res)) return;
-      const body = JSON.parse((await readBody(req, 65536)).toString('utf8') || '{}');
+      const body = await readJSON(req, 65536);
       let normalized;
       try {
         normalized = normalizeBridgeURL(body.url);
@@ -667,7 +710,7 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/bridge/api/admin/remove') {
       if (!requireAdmin(req, res)) return;
-      const body = JSON.parse((await readBody(req, 65536)).toString('utf8') || '{}');
+      const body = await readJSON(req, 65536);
       const removed = pool.remove(String(body.url || ''));
       json(res, removed ? 200 : 404, { ok: removed });
       return;
@@ -675,7 +718,7 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/bridge/api/admin/reset') {
       if (!requireAdmin(req, res)) return;
-      const body = JSON.parse((await readBody(req, 65536)).toString('utf8') || '{}');
+      const body = await readJSON(req, 65536);
       const count = pool.reset(body.url ? String(body.url) : '');
       json(res, 200, { ok: true, reset: count });
       return;
@@ -683,7 +726,7 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/bridge/api/admin/max') {
       if (!requireAdmin(req, res)) return;
-      const body = JSON.parse((await readBody(req, 65536)).toString('utf8') || '{}');
+      const body = await readJSON(req, 65536);
       const value = Number(body.value);
       if (!Number.isInteger(value) || value < 1) {
         json(res, 400, { ok: false, error: '1以上の整数を指定してください' });
@@ -722,6 +765,16 @@ const server = http.createServer(async (req, res) => {
 
     html(res, homeHTML);
   } catch (err) {
+    if (err instanceof RequestError) {
+      log(`[http] ${pathname} rejected: ${err.message}`);
+      if (!res.headersSent) {
+        res.writeHead(err.status, { 'content-type': 'text/plain; charset=utf-8', connection: 'close' }).end(err.message);
+      } else {
+        res.end();
+      }
+      req.resume();
+      return;
+    }
     log(`[http] ${pathname} failed: ${err.message}`);
     if (!res.headersSent) res.writeHead(500).end('internal error');
     else res.end();
@@ -781,13 +834,25 @@ if (config.obfs) {
   obfsServer.on('error', (err) => {
     log(`Obfs listen error on ${config.obfs}: ${err.message}`);
   });
+  obfsServerRef = obfsServer;
 }
 
 server.listen(Number(config.listenPort) || 8090, () => {
   log(`NeConnect Bridge Server listening on ${config.listen}`);
 });
 
+// 中継の応答待ちで固まらないよう、待ち時間に上限を置く。
+server.headersTimeout = 65 * 1000;
+server.requestTimeout = 120 * 1000;
+server.keepAliveTimeout = 65 * 1000;
+
 process.on('SIGTERM', () => {
   tunnels.closeAll();
+  if (obfsServerRef) obfsServerRef.close();
   server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
+});
+
+process.on('unhandledRejection', (err) => {
+  log(`[process] unhandled rejection: ${err && err.message ? err.message : err}`);
 });

@@ -68,7 +68,14 @@ var (
 )
 
 func initLogger(dir string) {
-	f, err := os.OpenFile(filepath.Join(dir, "nctb.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	path := filepath.Join(dir, "nctb.log")
+	// 記録が大きくなりすぎたら、前の分を退けてから書き始める。
+	if st, err := os.Stat(path); err == nil && st.Size() > 4*1024*1024 {
+		old := path + ".1"
+		_ = os.Remove(old)
+		_ = os.Rename(path, old)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err == nil {
 		logFile = f
 		logf("=== NeConnect Bridge started ===")
@@ -95,7 +102,7 @@ func exeDir() string {
 	return filepath.Dir(p)
 }
 
-const defaultMultiURLs = "https://bridge.example.com/bridge/server\nhttps://bridge.example.com/bridge/server\nssh://bridge.example.com:22"
+const defaultMultiURLs = "https://bridge.example.com/bridge/server\nssh://bridge.example.com:22"
 
 func loadConfig(dir string) Config {
 	cfg := Config{
@@ -540,18 +547,30 @@ var connectionMethods = []connMethod{
 func methodsForMode(mode string) []connMethod {
 	switch mode {
 	case "speed":
-		return connectionMethods[0:1]
+		return speedMethods
 	case "balance":
-		return connectionMethods[1:2]
+		return balanceMethods
 	case "secure":
-		return connectionMethods[2:]
+		return secureMethods
 	}
 	return connectionMethods
 }
 
+// 各モードは、速い順の一覧のどの範囲を使うかだけを決める。
+var (
+	speedMethods   = connectionMethods[:2]
+	balanceMethods = connectionMethods[:5]
+	secureMethods  = connectionMethods[2:]
+)
+
 func officialHostKeyCallback() ssh.HostKeyCallback {
+	if strings.TrimSpace(officialSSHHostKeyLine) == "" {
+		logf("ssh host key is not configured; set officialSSHHostKeyLine for your server")
+		return ssh.InsecureIgnoreHostKey()
+	}
 	pk, _, _, _, err := ssh.ParseAuthorizedKey([]byte(officialSSHHostKeyLine))
 	if err != nil {
+		logf("ssh host key could not be read (%v); continuing without pinning", err)
 		return ssh.InsecureIgnoreHostKey()
 	}
 	return ssh.FixedHostKey(pk)
@@ -717,12 +736,15 @@ func (e *bridgeEngine) tryObfsSSH(name string, dialFn func() (net.Conn, error)) 
 		logf("[%s] transport failed: %v", name, err)
 		return nil, err
 	}
+	// 相手が黙ったままでも待ち続けないよう、手順の間に上限を置く。
+	_ = raw.SetDeadline(time.Now().Add(10 * time.Second))
 	obfsConn, err := obfs.Wrap(raw, obfsKey)
 	if err != nil {
 		_ = raw.Close()
 		logf("[%s] handshake failed: %v", name, err)
 		return nil, err
 	}
+	_ = raw.SetDeadline(time.Time{})
 	sshAddr := e.sshHost
 	if sshAddr == "" {
 		sshAddr = defaultSSHHost
@@ -765,6 +787,9 @@ func (e *bridgeEngine) dialSSHDirect(addr string) (*ssh.Client, error) {
 func (e *bridgeEngine) dialSSHTransport() (*ssh.Client, error) {
 	var errs []string
 	for _, m := range e.methods {
+		if m.kind == methodWSPool {
+			continue
+		}
 		c, err := e.dialMethod(m)
 		if err == nil {
 			return c, nil
@@ -1266,6 +1291,9 @@ func serveSOCKS5(ln net.Listener, eng *bridgeEngine) {
 func handleSOCKS5(c net.Conn, eng *bridgeEngine) {
 	defer c.Close()
 
+	// 何も送ってこない相手につながったままにしない。
+	_ = c.SetDeadline(time.Now().Add(30 * time.Second))
+
 	hdr := make([]byte, 2)
 	if _, err := io.ReadFull(c, hdr); err != nil || hdr[0] != 0x05 {
 		return
@@ -1334,6 +1362,7 @@ func handleSOCKS5(c net.Conn, eng *bridgeEngine) {
 	if _, err := c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
 		return
 	}
+	_ = c.SetDeadline(time.Time{})
 
 	pool := &bufPool64
 	if eng.pool != nil {
