@@ -64,36 +64,14 @@ func (s *session) connect(serverURLs string, modeIdx int, withSystemProxy bool, 
 	var allErrs []string
 
 	for idx, rawURL := range urlList {
-		var wsBaseHTTP string
-		sshHost := defaultSSHHost
-		obfsHost := defaultObfsHost
-		isSSHOnly := false
-		if len(rawURL) > 6 && rawURL[:6] == "ssh://" {
-			isSSHOnly = true
-			sshHost = rawURL[6:]
-			if !containsColon(sshHost) {
-				sshHost += ":22"
-			}
-		} else {
-			_, httpURL, uerr := toWSURL(rawURL, "balance")
-			if uerr != nil {
-				allErrs = append(allErrs, rawURL+": "+uerr.Error())
-				continue
-			}
-			wsBaseHTTP = httpURL
-			meta := fetchMeta(httpURL)
-			sshHost = meta.SSHHost
-			obfsHost = meta.ObfsHost
-		}
-		if isSSHOnly && selectedMode == "speed" {
+		_, httpURL, uerr := toWSURL(rawURL, "balance")
+		if uerr != nil {
+			allErrs = append(allErrs, rawURL+": "+uerr.Error())
 			continue
 		}
 		setStatus(fmt.Sprintf("%sモードで接続中... [%d/%d]", modeLabels[selectedMode], idx+1, len(urlList)))
-		var pollURL string
-		if !isSSHOnly {
-			pollURL = trimServerSuffix(wsBaseHTTP) + "/poll"
-		}
-		e, cerr := newBridgeEngine(selectedMode, wsBaseHTTP, pollURL, sshHost, obfsHost, s.signer)
+		pollURL := trimServerSuffix(httpURL) + "/poll"
+		e, cerr := newBridgeEngine(selectedMode, httpURL, pollURL, s.signer)
 		if cerr == nil {
 			eng = e
 			label = modeLabels[selectedMode]
@@ -176,15 +154,6 @@ func (s *session) cleanup() {
 			bk.restore()
 		}
 	})
-}
-
-func containsColon(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] == ':' {
-			return true
-		}
-	}
-	return false
 }
 
 func trimServerSuffix(u string) string {
