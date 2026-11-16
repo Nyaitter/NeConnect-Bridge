@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="ja" data-nui-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ダッシュボード - NeConnect Bridge</title>
+<style>
+  :where(:root) {
+    --nui-accent: #ff9900;
+    --nui-accent-hover: #e88b00;
+    --nui-accent-on: #1f1f1f;
+    --nui-border: #eff3f4;
+    --nui-bg: #ffffff;
+    --nui-surface: #f9f9f9;
+    --nui-text: #0f1419;
+    --nui-muted: #536471;
+    --nui-danger: #d92d20;
+    --nui-radius-sm: 8px;
+    --nui-radius: 12px;
+    --nui-radius-pill: 9999px;
+    --nui-shadow: 0 1px 2px rgb(15 20 25 / 5%);
+    --nui-font: "Noto Sans JP", system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    [data-nui-theme="auto"] {
+      --nui-border: #2f363d;
+      --nui-bg: #1c1d21;
+      --nui-surface: #18191d;
+      --nui-text: #ffffff;
+      --nui-muted: #c9ccd1;
+      --nui-shadow: 0 1px 2px rgb(0 0 0 / 35%);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--nui-bg);
+    color: var(--nui-text);
+    font-family: var(--nui-font);
+    line-height: 1.6;
+  }
+  .nui-wrap {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 36px 20px 64px;
+  }
+  .nui-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 24px;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .nui-brand {
+    font-size: 20px;
+    font-weight: 700;
+    text-decoration: none;
+    color: var(--nui-text);
+  }
+  .nui-card {
+    background: var(--nui-surface);
+    border: 1px solid var(--nui-border);
+    border-radius: var(--nui-radius);
+    box-shadow: var(--nui-shadow);
+    padding: 24px;
+    margin-bottom: 16px;
+  }
+  .nui-card h1, .nui-card h2 {
+    margin: 0 0 12px;
+    font-size: 18px;
+  }
+  .nui-muted {
+    color: var(--nui-muted);
+    margin: 0 0 14px;
+    font-size: 14px;
+  }
+  .nui-btn {
+    display: inline-block;
+    background: var(--nui-accent);
+    color: var(--nui-accent-on);
+    text-decoration: none;
+    font-weight: 700;
+    font-size: 14px;
+    padding: 9px 18px;
+    border-radius: var(--nui-radius-pill);
+    border: none;
+    cursor: pointer;
+  }
+  .nui-btn:hover { background: var(--nui-accent-hover); }
+  .nui-btn-sub {
+    background: var(--nui-bg);
+    color: var(--nui-text);
+    border: 1px solid var(--nui-border);
+    font-weight: 600;
+    font-size: 13.5px;
+    padding: 8px 14px;
+    border-radius: var(--nui-radius-pill);
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .nui-btn-danger {
+    background: transparent;
+    color: var(--nui-danger);
+    border: 1px solid var(--nui-danger);
+    font-weight: 600;
+    font-size: 12.5px;
+    padding: 5px 12px;
+    border-radius: var(--nui-radius-pill);
+    cursor: pointer;
+  }
+  .nui-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .nui-code {
+    flex: 1;
+    min-width: 220px;
+    background: var(--nui-bg);
+    border: 1px solid var(--nui-border);
+    border-radius: var(--nui-radius-sm);
+    padding: 10px 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+    color: var(--nui-text);
+  }
+  .item {
+    border: 1px solid var(--nui-border);
+    background: var(--nui-bg);
+    border-radius: var(--nui-radius-sm);
+    padding: 14px;
+    margin-bottom: 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .item-url {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+    word-break: break-all;
+  }
+  .item-meta {
+    font-size: 13px;
+    color: var(--nui-muted);
+    margin-top: 4px;
+  }
+  .badge-ok { color: #10b981; font-weight: 700; }
+  .badge-full { color: var(--nui-danger); font-weight: 700; }
+  .nui-note { margin-top: 10px; font-size: 13px; color: var(--nui-muted); }
+</style>
+</head>
+<body class="nui-root">
+  <div class="nui-wrap">
+    <header class="nui-header">
+      <a class="nui-brand" href="/bridge">NeConnect Bridge</a>
+      <div class="nui-row">
+        <a class="nui-btn-sub" href="/bridge">ホーム</a>
+        <button class="nui-btn-sub" id="logoutBtn" style="display:none;" onclick="logout()">ログアウト</button>
+      </div>
+    </header>
+
+    <section class="nui-card" id="loginCard" style="display:none;">
+      <h1>ダッシュボード</h1>
+      <p class="nui-muted">登録したブリッジURLの状態や使用回数を確認するには、Nyaitter でサインインしてください。</p>
+      <a class="nui-btn" href="/bridge/auth/login">Nyaitter でサインイン</a>
+    </section>
+
+    <div id="authedArea" style="display:none;">
+      <section class="nui-card">
+        <h1 id="userTitle">ダッシュボード</h1>
+        <div class="nui-row">
+          <input class="nui-code" id="regInput" type="text" placeholder="https://example.com/bridge/server">
+          <button class="nui-btn" id="regBtn" onclick="regBridge()">登録</button>
+        </div>
+        <div class="nui-note" id="regOut"></div>
+      </section>
+
+      <section class="nui-card">
+        <h2>登録済みブリッジURL</h2>
+        <div id="listArea"><p class="nui-muted">読み込み中...</p></div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    async function init() {
+      const res = await fetch("/bridge/auth/me");
+      const data = await res.json();
+      if (!data.logged_in) {
+        document.getElementById("loginCard").style.display = "block";
+        return;
+      }
+      document.getElementById("authedArea").style.display = "block";
+      document.getElementById("logoutBtn").style.display = "inline-block";
+      document.getElementById("userTitle").textContent = data.user.name + " @" + data.user.handle;
+      loadList();
+    }
+
+    async function loadList() {
+      const res = await fetch("/bridge/api/my-bridges");
+      const data = await res.json();
+      const area = document.getElementById("listArea");
+      if (!data.items || data.items.length === 0) {
+        area.innerHTML = '<p class="nui-muted">登録されているブリッジURLはありません。</p>';
+        return;
+      }
+      area.innerHTML = "";
+      for (const it of data.items) {
+        const div = document.createElement("div");
+        div.className = "item";
+        const left = document.createElement("div");
+        const u = document.createElement("div");
+        u.className = "item-url";
+        u.textContent = it.url;
+        const meta = document.createElement("div");
+        meta.className = "item-meta";
+        const st = it.active ? '<span class="badge-ok">有効</span>' : '<span class="badge-full">上限到達</span>';
+        meta.innerHTML = st + " ・ 使用回数 " + it.used + " / " + it.max;
+        left.appendChild(u);
+        left.appendChild(meta);
+
+        const del = document.createElement("button");
+        del.className = "nui-btn-danger";
+        del.textContent = "削除";
+        del.onclick = async () => {
+          await fetch("/bridge/api/delete", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({url: it.url})
+          });
+          loadList();
+        };
+
+        div.appendChild(left);
+        div.appendChild(del);
+        area.appendChild(div);
+      }
+    }
+
+    async function regBridge() {
+      const input = document.getElementById("regInput");
+      const btn = document.getElementById("regBtn");
+      const out = document.getElementById("regOut");
+      const url = input.value.trim();
+      if (!url) return;
+      btn.disabled = true;
+      out.textContent = "確認して登録しています...";
+      try {
+        const res = await fetch("/bridge/register", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({url})
+        });
+        const data = await res.json();
+        if (data.ok) {
+          input.value = "";
+          out.textContent = "登録しました";
+          loadList();
+        } else {
+          out.textContent = data.error || "登録できませんでした";
+        }
+      } catch (e) {
+        out.textContent = "登録できませんでした";
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function logout() {
+      await fetch("/bridge/auth/logout", {method: "POST"});
+      location.reload();
+    }
+
+    init();
+  </script>
+</body>
+</html>
