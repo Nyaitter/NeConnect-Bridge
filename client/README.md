@@ -83,4 +83,4 @@ cd client
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w -H windowsgui" -o NeConnectBridge.exe .
 ```
 
-接続先は `main.go` の先頭にあります。自分のサーバーに合わせて差し替えてください。
+接続先と合言葉は `main.go` の先頭、サーバーの公開鍵は `internal/e2e/e2e.go` にあります。自分のサーバーに合わせて差し替えてください。
