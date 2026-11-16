@@ -44,6 +44,27 @@ class Auth {
     return Boolean(this.config.authApi && this.appToken);
   }
 
+  // 途中でやめたサインインの情報が残り続けないようにする。
+  rememberPending(state, verifier) {
+    const now = Date.now();
+    for (const [key, item] of this.pending) {
+      if (now - item.at > 10 * 60 * 1000) this.pending.delete(key);
+    }
+    if (this.pending.size >= 1000) {
+      const oldest = this.pending.keys().next();
+      if (!oldest.done) this.pending.delete(oldest.value);
+    }
+    this.pending.set(state, { verifier, at: now });
+  }
+
+  takePending(state) {
+    const item = this.pending.get(state);
+    this.pending.delete(state);
+    if (!item) return null;
+    if (Date.now() - item.at > 10 * 60 * 1000) return null;
+    return item.verifier;
+  }
+
   signSession(user) {
     const payload = Buffer.from(JSON.stringify(user)).toString('base64url');
     const signature = crypto.createHmac('sha256', this.secret).update(payload).digest('base64url');
@@ -84,7 +105,7 @@ class Auth {
     const state = randomURLSafe(16);
     const verifier = randomURLSafe(32);
     const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
-    this.pending.set(state, verifier);
+    this.rememberPending(state, verifier);
     const body = {
       app_id: this.config.authAppId,
       name: 'NeConnect Bridge',
@@ -109,8 +130,7 @@ class Auth {
   }
 
   async exchange(state, code) {
-    const verifier = this.pending.get(state);
-    this.pending.delete(state);
+    const verifier = this.takePending(state);
     if (!verifier || !code) throw new Error('invalid callback');
     const response = await fetch(`${this.config.authApi}/token`, {
       method: 'POST',

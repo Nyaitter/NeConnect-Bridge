@@ -27,7 +27,10 @@ class BridgePool {
       this.entries = [];
       return;
     }
-    this.entries = Array.isArray(parsed) ? parsed.map((entry) => this.normalize(entry)) : [];
+    const list = Array.isArray(parsed) ? parsed : [];
+    this.entries = list
+      .filter((entry) => entry && typeof entry.url === 'string' && entry.url.trim() !== '')
+      .map((entry) => this.normalize(entry));
   }
 
   normalize(entry) {
@@ -45,9 +48,22 @@ class BridgePool {
     };
   }
 
+  // 書き込みの途中で止まっても、前の内容が壊れないようにする。
   save() {
     const body = JSON.stringify(this.entries, null, 2);
-    fs.writeFileSync(this.file, body, { mode: 0o600 });
+    const temp = path.join(path.dirname(this.file), `.${path.basename(this.file)}.${process.pid}.tmp`);
+    try {
+      fs.mkdirSync(path.dirname(this.file), { recursive: true });
+      fs.writeFileSync(temp, body, { mode: 0o600 });
+      fs.renameSync(temp, this.file);
+    } catch (err) {
+      try {
+        fs.unlinkSync(temp);
+      } catch {
+        // nothing left to remove
+      }
+      throw err;
+    }
   }
 
   countClients(entry) {
@@ -56,7 +72,7 @@ class BridgePool {
 
   pick(cid) {
     const eligible = this.entries.filter(
-      (entry) => this.countClients(entry) < this.maxClients && !entry.clients[cid],
+      (entry) => entry.url && this.countClients(entry) < this.maxClients && !entry.clients[cid],
     );
     if (eligible.length === 0) return null;
     const chosen = eligible[crypto.randomInt(eligible.length)];
@@ -117,9 +133,16 @@ class BridgePool {
       url: entry.url,
       used: this.countClients(entry),
       max: this.maxClients,
+      owner_id: entry.owner_id,
       owner_handle: entry.owner_handle,
+      owner_name: entry.owner_name,
       added_at: entry.added_at,
     }));
+  }
+
+  // 登録した本人のものだけを返す。
+  listOwned(ownerId) {
+    return this.list().filter((entry) => entry.owner_id === ownerId);
   }
 }
 

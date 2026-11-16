@@ -15,7 +15,7 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-const serverPubB64 = "2NiPxqtFVMmk+7BgKUm7FQUmAu7Zk6nMSwuL1tHfJF8="
+const serverPubB64 = ""
 
 func deriveAEADs(shared, clientPub []byte) (cipher.AEAD, cipher.AEAD, error) {
 	k1 := sha256.Sum256(append(append([]byte("c2s:"), shared...), clientPub...))

@@ -304,8 +304,14 @@ func waitForLaunched(proc *launchedProcess, exe string) {
 		return
 	}
 	time.Sleep(1200 * time.Millisecond)
-	for countProcesses(exe) > 0 {
+	// 同じ名前の別のアプリが開きっぱなしでも、見張り続けないようにする。
+	deadline := time.Now().Add(12 * time.Hour)
+	for time.Now().Before(deadline) {
+		if countProcesses(exe) == 0 {
+			logf("app finished: %s", exe)
+			return
+		}
 		time.Sleep(2 * time.Second)
 	}
-	logf("app finished: %s", exe)
+	logf("stopped watching %s after the time limit", exe)
 }

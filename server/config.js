@@ -13,6 +13,15 @@ function readTrimmed(file) {
   }
 }
 
+function readPackageVersion() {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    return typeof pkg.version === 'string' ? pkg.version : '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+
 function parseArgs(argv, spec) {
   const out = {};
   for (let i = 0; i < argv.length; i += 1) {
@@ -65,6 +74,7 @@ function loadConfig(argv) {
     sshHost: flags['ssh-host'] || process.env.NCTB_SSH_HOST || '',
     obfsHost: flags['obfs-host'] || process.env.NCTB_OBFS_HOST || '',
     releasesDir: path.resolve(flags.releases || process.env.NCTB_RELEASES || path.join(dataDir, 'releases')),
+    clientVersion: readPackageVersion(),
     maxClients: Number(flags['max-clients'] || process.env.NCTB_MAX_CLIENTS || 5),
     authApi: (flags['auth-api'] || process.env.NCTB_AUTH_API || '').replace(/\/+$/, ''),
     authAppId: flags['auth-app-id'] || process.env.NCTB_AUTH_APP_ID || 'neconnect-bridge',

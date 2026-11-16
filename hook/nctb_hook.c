@@ -75,6 +75,9 @@ static int g_alloc_count = 0;
 static HMODULE g_patched[NCTB_MAX_MODS];
 static int g_patched_count = 0;
 
+static int register_alloc(void *a, void *b, void *c);
+static int take_alloc(void *a, void **b, void **c);
+
 /* ------------------------------------------------------------------ */
 /* 小さなヘルパー                                                     */
 /* ------------------------------------------------------------------ */
@@ -219,17 +222,28 @@ static const char *fake_name_for(unsigned int ip)
 	return res;
 }
 
-static void register_alloc(void *a, void *b, void *c)
+/* 使わなくなった枠を再利用する。埋まったら 0 を返し、呼び出し側は元の解決に戻す。 */
+static int register_alloc(void *a, void *b, void *c)
 {
+	int i;
+	int slot = -1;
 	EnterCriticalSection(&g_lock);
-	if (g_alloc_count < NCTB_MAX_ALLOC) {
-		g_allocs[g_alloc_count].a = a;
-		g_allocs[g_alloc_count].b = b;
-		g_allocs[g_alloc_count].c = c;
-		g_allocs[g_alloc_count].used = 1;
-		g_alloc_count++;
+	for (i = 0; i < g_alloc_count; i++) {
+		if (!g_allocs[i].used) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot < 0 && g_alloc_count < NCTB_MAX_ALLOC)
+		slot = g_alloc_count++;
+	if (slot >= 0) {
+		g_allocs[slot].a = a;
+		g_allocs[slot].b = b;
+		g_allocs[slot].c = c;
+		g_allocs[slot].used = 1;
 	}
 	LeaveCriticalSection(&g_lock);
+	return slot >= 0;
 }
 
 static int take_alloc(void *a, void **b, void **c)
@@ -349,6 +363,39 @@ static int socks5_handshake(SOCKET s, const char *host, int port, int is_domain)
 	return 0;
 }
 
+/* 入口への接続。相手が非同期で使っている場合は、準備できるまで待つ。 */
+static int connect_entry(SOCKET s, const struct sockaddr *addr, int len, int *was_nonblocking)
+{
+	int rc = g_connect(s, addr, len);
+	if (rc == 0)
+		return 0;
+	if (WSAGetLastError() != WSAEWOULDBLOCK)
+		return -1;
+
+	*was_nonblocking = 1;
+	{
+		fd_set wfds;
+		fd_set efds;
+		struct timeval tv;
+		int sel;
+		int err = 0;
+		int elen = (int)sizeof(err);
+
+		FD_ZERO(&wfds);
+		FD_SET(s, &wfds);
+		FD_ZERO(&efds);
+		FD_SET(s, &efds);
+		tv.tv_sec = NCTB_CONNECT_TIMEOUT_MS / 1000;
+		tv.tv_usec = 0;
+		sel = select(0, NULL, &wfds, &efds, &tv);
+		if (sel <= 0)
+			return -1;
+		if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &elen) != 0 || err != 0)
+			return -1;
+	}
+	return 0;
+}
+
 static int redirect_socket(SOCKET s, const char *host, int port, int is_domain, int family)
 {
 	struct sockaddr_in local4;
@@ -356,15 +403,15 @@ static int redirect_socket(SOCKET s, const char *host, int port, int is_domain, 
 	u_long mode = 0;
 	u_long nonblock = 1;
 	DWORD timeout = NCTB_CONNECT_TIMEOUT_MS;
+	DWORD old_recv = 0;
+	DWORD old_send = 0;
+	int recv_len = (int)sizeof(old_recv);
+	int send_len = (int)sizeof(old_send);
+	int was_nonblocking = 0;
 	int rc;
 
 	if (g_port <= 0)
 		return -1;
-
-	/* 呼び出し側が非同期でも扱えるよう、いったん同期に切り替える */
-	ioctlsocket(s, FIONBIO, &mode);
-	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
-	setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof(timeout));
 
 	memset(&local4, 0, sizeof(local4));
 	memset(&local6, 0, sizeof(local6));
@@ -379,14 +426,27 @@ static int redirect_socket(SOCKET s, const char *host, int port, int is_domain, 
 	local6.sin6_addr.s6_bytes[15] = 1;
 
 	if (family == AF_INET6)
-		rc = g_connect(s, (const struct sockaddr *)&local6, (int)sizeof(local6));
+		rc = connect_entry(s, (const struct sockaddr *)&local6, (int)sizeof(local6), &was_nonblocking);
 	else
-		rc = g_connect(s, (const struct sockaddr *)&local4, (int)sizeof(local4));
+		rc = connect_entry(s, (const struct sockaddr *)&local4, (int)sizeof(local4), &was_nonblocking);
 
-	if (rc == 0)
+	if (rc == 0) {
+		/* 手順の間だけ応答待ちに上限を置く。終わったら元の設定に戻す。 */
+		getsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&old_recv, &recv_len);
+		getsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char *)&old_send, &send_len);
+		if (was_nonblocking)
+			ioctlsocket(s, FIONBIO, &mode);
+		setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+		setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof(timeout));
+
 		rc = socks5_handshake(s, host, port, is_domain);
 
-	ioctlsocket(s, FIONBIO, &nonblock);
+		setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&old_recv, sizeof(old_recv));
+		setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&old_send, sizeof(old_send));
+		if (was_nonblocking)
+			ioctlsocket(s, FIONBIO, &nonblock);
+	}
+
 	if (rc != 0) {
 		WSASetLastError(WSAECONNREFUSED);
 		return SOCKET_ERROR;
@@ -481,15 +541,36 @@ static int fill_addrinfo(const char *node, unsigned short port, const ADDRINFOA 
 	ai->ai_addr = (struct sockaddr *)sa;
 	ai->ai_canonname = canon;
 	ai->ai_next = NULL;
-	register_alloc(ai, sa, canon);
+	if (!register_alloc(ai, sa, canon)) {
+		free(sa);
+		free(ai);
+		free(canon);
+		return -1;
+	}
 	*res = ai;
 	return 0;
+}
+
+/* 仮の IPv4 を返してよい相手か。IPv6 だけを求める呼び出しはそのまま任せる。 */
+static int hints_accept_ipv4(const ADDRINFOA *hints)
+{
+	if (!hints)
+		return 1;
+	return hints->ai_family == AF_UNSPEC || hints->ai_family == AF_INET;
+}
+
+static int hints_accept_ipv4w(const ADDRINFOW *hints)
+{
+	if (!hints)
+		return 1;
+	return hints->ai_family == AF_UNSPEC || hints->ai_family == AF_INET;
 }
 
 static int WSAAPI hook_getaddrinfo(PCSTR node, PCSTR service, const ADDRINFOA *hints, PADDRINFOA *res)
 {
 	int port = 0;
-	if (g_port > 0 && res && node && service && should_map_name(node) && (!hints || (hints->ai_socktype != SOCK_DGRAM && hints->ai_socktype != SOCK_RAW))) {
+	if (g_port > 0 && res && node && service && should_map_name(node) && hints_accept_ipv4(hints) &&
+	    (!hints || (hints->ai_socktype != SOCK_DGRAM && hints->ai_socktype != SOCK_RAW))) {
 		port = atoi(service);
 		if (port > 0 && port < 65536 && fill_addrinfo(node, (unsigned short)port, hints, res) == 0)
 			return 0;
@@ -503,7 +584,8 @@ static int WSAAPI hook_GetAddrInfoW(PCWSTR node, PCWSTR service, const ADDRINFOW
 {
 	char nodeA[256];
 	char serviceA[32];
-	if (g_port > 0 && res && node && service && (!hints || (hints->ai_socktype != SOCK_DGRAM && hints->ai_socktype != SOCK_RAW))) {
+	if (g_port > 0 && res && node && service && hints_accept_ipv4w(hints) &&
+	    (!hints || (hints->ai_socktype != SOCK_DGRAM && hints->ai_socktype != SOCK_RAW))) {
 		int i;
 		for (i = 0; i < (int)sizeof(nodeA) - 1 && node[i]; i++)
 			nodeA[i] = (char)node[i];
@@ -530,9 +612,10 @@ static int WSAAPI hook_GetAddrInfoW(PCWSTR node, PCWSTR service, const ADDRINFOW
 						ai->ai_addr = (struct sockaddr *)sa;
 						ai->ai_canonname = canon;
 						MultiByteToWideChar(CP_ACP, 0, nodeA, -1, canon, 255);
-						register_alloc(ai, sa, canon);
-						*res = ai;
-						return 0;
+						if (register_alloc(ai, sa, canon)) {
+							*res = ai;
+							return 0;
+						}
 					}
 					free(sa);
 					free(ai);
@@ -635,7 +718,7 @@ static int inject_self(HANDLE hp)
 		VirtualFreeEx(hp, mem, 0, MEM_RELEASE);
 		return 0;
 	}
-	WaitForSingleObject(th, 15000);
+	WaitForSingleObject(th, 5000);
 	CloseHandle(th);
 	VirtualFreeEx(hp, mem, 0, MEM_RELEASE);
 	return 1;
@@ -649,6 +732,7 @@ static BOOL WINAPI hook_CreateProcessW(LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRI
 	LPPROCESS_INFORMATION local = pi;
 	PROCESS_INFORMATION tmp;
 	BOOL use_dummy = 0;
+	BOOL was_suspended = (flags & CREATE_SUSPENDED) != 0;
 
 	if (!local) {
 		memset(&tmp, 0, sizeof(tmp));
@@ -659,7 +743,8 @@ static BOOL WINAPI hook_CreateProcessW(LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRI
 	if (ok) {
 		if (local->hProcess)
 			inject_self(local->hProcess);
-		if (local->hThread)
+		/* 呼び出し側が止めたまま起動を求めた場合は、そのままにする。 */
+		if (local->hThread && !was_suspended)
 			ResumeThread(local->hThread);
 		if (use_dummy) {
 			if (local->hProcess)
@@ -679,6 +764,7 @@ static BOOL WINAPI hook_CreateProcessA(LPCSTR app, LPSTR cmd, LPSECURITY_ATTRIBU
 	LPPROCESS_INFORMATION local = pi;
 	PROCESS_INFORMATION tmp;
 	BOOL use_dummy = 0;
+	BOOL was_suspended = (flags & CREATE_SUSPENDED) != 0;
 
 	if (!local) {
 		memset(&tmp, 0, sizeof(tmp));
@@ -689,7 +775,7 @@ static BOOL WINAPI hook_CreateProcessA(LPCSTR app, LPSTR cmd, LPSECURITY_ATTRIBU
 	if (ok) {
 		if (local->hProcess)
 			inject_self(local->hProcess);
-		if (local->hThread)
+		if (local->hThread && !was_suspended)
 			ResumeThread(local->hThread);
 		if (use_dummy) {
 			if (local->hProcess)
@@ -826,7 +912,7 @@ static void refresh_modules(void)
 	CloseHandle(snap);
 }
 
-static void resolve_reals(void)
+static int resolve_reals(void)
 {
 	HMODULE ws2 = GetModuleHandleA("ws2_32.dll");
 	HMODULE k32;
@@ -846,18 +932,31 @@ static void resolve_reals(void)
 		g_cpa = (fn_CreateProcessA)GetProcAddress(k32, "CreateProcessA");
 		g_cpw = (fn_CreateProcessW)GetProcAddress(k32, "CreateProcessW");
 	}
-	if (!g_connect || !g_getaddrinfo)
-		g_port = 0; /* 使えないので何もしない */
+	return g_connect && g_getaddrinfo;
 }
 
 static DWORD WINAPI worker(LPVOID param)
 {
+	int attempt;
+	int passes = 0;
+
 	(void)param;
-	Sleep(50);
-	resolve_reals();
+	Sleep(120);
+	/* 読み込み途中のモジュールがあっても、少しずつやり直す。 */
+	for (attempt = 0; attempt < 50; attempt++) {
+		if (resolve_reals())
+			break;
+		Sleep(200);
+	}
+	if (!g_connect || !g_getaddrinfo) {
+		g_port = 0; /* 使えないので何もしない */
+		return 0;
+	}
 	for (;;) {
 		refresh_modules();
-		Sleep(NCTB_MAX_MODULE_REFRESH);
+		passes++;
+		/* 落ち着いてきたら、見に行く間隔を広げる。 */
+		Sleep(passes < 25 ? NCTB_MAX_MODULE_REFRESH : 1500);
 	}
 	return 0;
 }

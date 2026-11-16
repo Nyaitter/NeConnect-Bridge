@@ -266,7 +266,9 @@ func (u *mainUI) postError(title, text string) {
 }
 
 func (u *mainUI) showLogWindow() {
-	u.wake()
+	if u.hwnd == 0 {
+		return
+	}
 	procPostMessageW.Call(u.hwnd, wmAppShowLog, 0, 0)
 }
 
@@ -554,7 +556,14 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 					procSendMessageW.Call(ui.targetCombo, cbSetCurSel, targetApp, 0)
 					syncTarget()
 					setText(ui.appPathEdit, resolved)
-					setText(ui.statusLbl, "ドロップされたアプリを指定しました")
+					// すぐ書き換えられるよう、入れたパスを選択して焦点を移す。
+					procSendMessageW.Call(ui.appPathEdit, emSetSel, 0, ^uintptr(0))
+					procSetFocus.Call(ui.appPathEdit)
+					if count > 1 {
+						setText(ui.statusLbl, "1つ目のアプリを指定しました")
+					} else {
+						setText(ui.statusLbl, "ドロップされたアプリを指定しました")
+					}
 					logf("dropped: %s", resolved)
 				}
 			}

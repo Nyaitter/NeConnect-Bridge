@@ -13,10 +13,15 @@ function readExactly(stream, n) {
   return new Promise((resolve, reject) => {
     const attempt = () => {
       const chunk = stream.read(n);
-      if (chunk) {
+      if (!chunk) return;
+      // 終端では要求より短い分だけ返ることがあるので、そのまま受け取らない。
+      if (chunk.length < n) {
         cleanup();
-        resolve(chunk);
+        reject(new Error('stream closed'));
+        return;
       }
+      cleanup();
+      resolve(chunk);
     };
     const onEnd = () => {
       cleanup();
@@ -26,14 +31,20 @@ function readExactly(stream, n) {
       cleanup();
       reject(err);
     };
+    const onClose = () => {
+      cleanup();
+      reject(new Error('stream closed'));
+    };
     function cleanup() {
       stream.off('readable', attempt);
       stream.off('end', onEnd);
       stream.off('error', onError);
+      stream.off('close', onClose);
     }
     stream.on('readable', attempt);
     stream.on('end', onEnd);
     stream.on('error', onError);
+    stream.on('close', onClose);
     attempt();
   });
 }

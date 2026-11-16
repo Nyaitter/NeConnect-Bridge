@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -215,7 +216,26 @@ func clearActiveSocks(dir string) {
 	_ = os.Remove(p)
 }
 
+// probeSocks は、そのポートで入口が答えているかを短く確かめる。
+func probeSocks(port int, timeout time.Duration) bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), timeout)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		return false
+	}
+	reply := make([]byte, 2)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		return false
+	}
+	return reply[0] == 0x05 && reply[1] == 0x00
+}
+
 // readActiveSocks は生きている接続の入口を返す。
+// 前に落ちたときの情報が残っていても、そのまま使わない。
 func readActiveSocks(dir string) (activeSocksInfo, bool) {
 	var info activeSocksInfo
 	b, err := os.ReadFile(filepath.Join(dir, activeSocksFile))
@@ -223,17 +243,17 @@ func readActiveSocks(dir string) (activeSocksInfo, bool) {
 		return info, false
 	}
 	if err := json.Unmarshal(b, &info); err != nil {
+		clearActiveSocks(dir)
 		return info, false
 	}
-	if info.Port <= 0 || !isPIDAlive(uint32(info.PID)) {
+	if info.Port <= 0 || info.Port > 65535 || info.PID <= 0 || !isPIDAlive(uint32(info.PID)) {
 		logf("shared entry stale (pid=%d port=%d)", info.PID, info.Port)
+		clearActiveSocks(dir)
 		return info, false
 	}
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", info.Port), 700*time.Millisecond)
-	if err != nil {
-		logf("shared entry unreachable (port=%d): %v", info.Port, err)
+	if !probeSocks(info.Port, 900*time.Millisecond) {
+		logf("shared entry did not answer (pid=%d port=%d)", info.PID, info.Port)
 		return info, false
 	}
-	_ = conn.Close()
 	return info, true
 }

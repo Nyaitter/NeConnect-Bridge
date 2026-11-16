@@ -28,11 +28,14 @@ function watchOutput(child, pattern, timeoutMs) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      child.stdout?.removeListener('data', scan);
+      child.stderr?.removeListener('data', scan);
       resolve(value);
     };
     const scan = (chunk) => {
       const match = pattern.exec(String(chunk));
       if (match) finish(match[0]);
+      else pattern.lastIndex = 0;
     };
     const timer = setTimeout(() => finish(null), timeoutMs);
     child.stdout?.on('data', scan);
@@ -51,6 +54,9 @@ class TunnelManager {
   register(child, url) {
     const record = { child, url, startedAt: Date.now() };
     this.tunnels.push(record);
+    child.on('exit', () => {
+      this.tunnels = this.tunnels.filter((item) => item !== record);
+    });
     while (this.tunnels.length > 3) {
       const old = this.tunnels.shift();
       old.child.kill('SIGKILL');
