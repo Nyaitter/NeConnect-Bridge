@@ -19,8 +19,11 @@ import (
 // maxPart は、一部分として取り出す量の上限。
 const maxPart = 2 * 1024 * 1024
 
-// idleWait は、続きがまだ無いときに次を聞くまでの間。
-const idleWait = 25 * time.Millisecond
+// 続きが無いときに次を聞くまでの間。空振りが続くほど間を広げる。
+const (
+	idleWaitMin = 4 * time.Millisecond
+	idleWaitMax = 120 * time.Millisecond
+)
 
 type Conn struct {
 	base   string
@@ -30,6 +33,7 @@ type Conn struct {
 	pending     []byte
 	readOffset  int64
 	writeOffset int64
+	idleWait    time.Duration
 	rMu         sync.Mutex
 	wMu         sync.Mutex
 
@@ -40,7 +44,7 @@ type Conn struct {
 }
 
 // Dial は、続きを取りに行く形で中継を開く。
-func Dial(baseURL string, client *http.Client) (net.Conn, error) {
+func Dial(ctx context.Context, baseURL string, client *http.Client) (net.Conn, error) {
 	if client == nil {
 		return nil, errors.New("http client is required")
 	}
@@ -48,7 +52,7 @@ func Dial(baseURL string, client *http.Client) (net.Conn, error) {
 		return nil, errors.New("stream url is empty")
 	}
 	sid := endpoint.NewSessionID()
-	if err := endpoint.Open(client, baseURL, "range", sid); err != nil {
+	if err := endpoint.Open(ctx, client, baseURL, "range", sid); err != nil {
 		return nil, err
 	}
 	return &Conn{base: baseURL, sid: sid, client: client, done: make(chan struct{})}, nil
@@ -68,9 +72,18 @@ func (c *Conn) Read(p []byte) (int, error) {
 			return 0, err
 		}
 		if len(chunk) == 0 {
-			time.Sleep(idleWait)
+			if c.idleWait == 0 {
+				c.idleWait = idleWaitMin
+			} else if c.idleWait < idleWaitMax {
+				c.idleWait *= 2
+				if c.idleWait > idleWaitMax {
+					c.idleWait = idleWaitMax
+				}
+			}
+			time.Sleep(c.idleWait)
 			continue
 		}
+		c.idleWait = 0
 		c.pending = chunk
 	}
 	n := copy(p, c.pending)

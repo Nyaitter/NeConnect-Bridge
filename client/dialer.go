@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"neconnectbridge/internal/covert"
+	"neconnectbridge/internal/endpoint"
 )
 
 // altPorts は、ブリッジのホストへ届く代替の HTTPS ポート。
@@ -22,11 +23,25 @@ var altPorts = []string{"8443", "2053", "2083", "2087", "2096"}
 // 一つの接続方法にかける待ち時間の上限。
 const methodBudget = 7 * time.Second
 
+// 道筋を並べて試すときは、次の道筋を始めるまでの間を空ける。
+// 前の道筋が通るまでの待ちを、そのまま空費にしない。
+const (
+	raceStagger = 800 * time.Millisecond
+	raceWidth   = 6
+)
+
+// 一本の道筋で TCP と TLS を張るまでの上限。
+const (
+	dialTimeout      = 5 * time.Second
+	tlsHandshakeWait = 4 * time.Second
+)
+
 const (
 	// つなぐ準備として張っておく流れの数と、張り足す目安。
 	poolSize       = 12
 	poolLowWater   = 10
 	poolWarmBudget = 6 * time.Second
+	poolRefillMax  = 4
 )
 
 // dialStage は、ブリッジのホストへ届くまでの一つの道筋。
@@ -156,6 +171,17 @@ func newTransportDialer(host string) *transportDialer {
 
 // order は、通った道筋を先頭に、使えないと分かっている道筋を外して並べる。
 func (d *transportDialer) order(preferred []dialStage) []dialStage {
+	all := []dialStage{}
+	if st, ok := stageFromLabel(d.goodStage()); ok {
+		all = append(all, st)
+	}
+	all = append(all, preferred...)
+	all = append(all, standardStages()...)
+	return d.only(all)
+}
+
+// only は、渡された道筋だけを使える形に整える。
+func (d *transportDialer) only(stages []dialStage) []dialStage {
 	seen := map[string]bool{}
 	var all []dialStage
 	add := func(st dialStage) {
@@ -166,25 +192,15 @@ func (d *transportDialer) order(preferred []dialStage) []dialStage {
 		seen[label] = true
 		all = append(all, st)
 	}
+	for _, st := range stages {
+		add(st)
+	}
 	d.mu.Lock()
-	good := d.good
 	dead := make(map[string]bool, len(d.dead))
-	for key, value := range d.dead {
-		dead[key] = value
+	for key := range d.dead {
+		dead[key] = true
 	}
 	d.mu.Unlock()
-
-	if good != "" {
-		if st, ok := stageFromLabel(good); ok {
-			add(st)
-		}
-	}
-	for _, st := range preferred {
-		add(st)
-	}
-	for _, st := range standardStages() {
-		add(st)
-	}
 
 	out := make([]dialStage, 0, len(all))
 	for _, st := range all {
@@ -229,7 +245,10 @@ func (d *transportDialer) dialConn(ctx context.Context, st dialStage, port strin
 	}
 	raw, err := d.dialRaw(ctx, st, port)
 	if err != nil {
-		d.markDead(st.label())
+		// 打ち切っただけの道筋は、使えないと決めつけない。
+		if ctx.Err() == nil {
+			d.markDead(st.label())
+		}
 		return nil, err
 	}
 	if !useTLS {
@@ -241,11 +260,13 @@ func (d *transportDialer) dialConn(ctx context.Context, st dialStage, port strin
 		cfg.ServerName = host
 	}
 	conn := tls.Client(raw, cfg)
-	hctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	hctx, cancel := context.WithTimeout(ctx, tlsHandshakeWait)
 	defer cancel()
 	if err := conn.HandshakeContext(hctx); err != nil {
 		_ = raw.Close()
-		d.markDead(st.label())
+		if ctx.Err() == nil {
+			d.markDead(st.label())
+		}
 		return nil, fmt.Errorf("%s: %w", st.label(), err)
 	}
 	d.markGood(st.label())
@@ -258,7 +279,7 @@ func (d *transportDialer) dialRaw(ctx context.Context, st dialStage, port string
 	if st.port != "" {
 		port = st.port
 	}
-	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	dialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
 	var conn net.Conn
 	var err error
 	if st.any {
@@ -343,4 +364,104 @@ func (d *transportDialer) httpClient(st dialStage, timeout time.Duration, h2 boo
 		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 	}
 	return &http.Client{Timeout: timeout, Transport: tr}
+}
+
+// raceStages は、道筋を少しずつずらして並べ、最初に通ったものを採る。
+// 打ち切った道筋の接続は残さず、試していない道筋はそのまま残す。
+func raceStages[T interface{ Close() error }](parent context.Context, budget time.Duration, stages []dialStage, attempt func(context.Context, dialStage) (T, error)) (T, dialStage, error) {
+	var zero T
+	if len(stages) == 0 {
+		return zero, dialStage{}, noRouteErr(nil)
+	}
+	ctx, cancel := context.WithTimeout(parent, budget)
+	defer cancel()
+
+	type outcome struct {
+		value T
+		stage dialStage
+		err   error
+	}
+	results := make(chan outcome, len(stages))
+	launched, active := 0, 0
+	var errs []string
+	var stopErr error
+	nextLaunch := time.Now()
+
+	launch := func(st dialStage) {
+		launched++
+		active++
+		go func() {
+			v, err := attempt(ctx, st)
+			if ctx.Err() != nil {
+				// 負けた道筋は、開いた接続ごと片付ける。
+				if err == nil {
+					_ = v.Close()
+				}
+				results <- outcome{stage: st, err: ctx.Err()}
+				return
+			}
+			results <- outcome{value: v, stage: st, err: err}
+		}()
+	}
+	settle := func(r outcome) (T, dialStage, bool) {
+		active--
+		if r.err == nil {
+			cancel()
+			return r.value, r.stage, true
+		}
+		errs = append(errs, r.stage.label()+": "+r.err.Error())
+		if errors.Is(r.err, endpoint.ErrUnavailable) {
+			// 道筋を変えても答えは変わらないので、ここで打ち切る。
+			cancel()
+			stopErr = noRouteErr(errs)
+		}
+		return zero, dialStage{}, false
+	}
+
+	for {
+		// 試している道筋がもう無いなら、次はすぐ始める。
+		if active == 0 {
+			nextLaunch = time.Time{}
+		}
+		for launched < len(stages) && active < raceWidth && !time.Now().Before(nextLaunch) {
+			launch(stages[launched])
+			nextLaunch = time.Now().Add(raceStagger)
+		}
+		if active == 0 && launched >= len(stages) {
+			return zero, dialStage{}, noRouteErr(errs)
+		}
+		wait := time.Until(nextLaunch)
+		if stopErr != nil {
+			return zero, dialStage{}, stopErr
+		}
+		if wait <= 0 || launched >= len(stages) || active >= raceWidth {
+			select {
+			case r := <-results:
+				if v, st, ok := settle(r); ok {
+					return v, st, nil
+				}
+				if stopErr != nil {
+					return zero, dialStage{}, stopErr
+				}
+			case <-ctx.Done():
+				return zero, dialStage{}, noRouteErr(append(errs, "time budget spent"))
+			}
+			continue
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case r := <-results:
+			timer.Stop()
+			if v, st, ok := settle(r); ok {
+				return v, st, nil
+			}
+			if stopErr != nil {
+				return zero, dialStage{}, stopErr
+			}
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return zero, dialStage{}, noRouteErr(append(errs, "time budget spent"))
+		}
+	}
 }
