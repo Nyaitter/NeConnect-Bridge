@@ -19,7 +19,7 @@
     "client/internal/rangetunnel/rangetunnel.go": "981335afad933477a4ad474e98fcf746b7b1a341f053e4724411d5de4081f1ce",
     "client/internal/wsconn/wsconn.go": "34be7b4e7a7042818333d3f319e5f9c923f11f7c1e0f8039c7e50321801e89c8",
     "client/launcher_windows.go": "4229c04fcb4b9275ecd8cfd21bf5eaa9d1d05210818dc373fe408876187831ed",
-    "client/main.go": "49b609d2a08701a5d97a873183694d0251c7eecb14e6c5f8dc664ae8a156b7cf",
+    "client/main.go": "21a60a423c20394854c5eb3366803bf38772181ec3cfa941e04671a7dcc72ab2",
     "client/proxy.go": "0e33e43d2730155b5e31e40b9a40380503d2faac591b6f2715392b0e501f11ba",
     "client/session_windows.go": "a0b838e78a6088c5c19616891d1eb49c6352f20af170182c3cf5c7265f715582",
     "client/shortcut_windows.go": "f0323c4d9b6046b00e9b6501ee3567a9ce7737eac2a0c9b97e94bc5570f5ca38",
