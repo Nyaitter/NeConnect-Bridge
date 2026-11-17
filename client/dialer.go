@@ -9,24 +9,28 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"neconnectbridge/internal/covert"
 	"neconnectbridge/internal/endpoint"
+	"neconnectbridge/internal/routepick"
 )
 
 // altPorts は、ブリッジのホストへ届く代替の HTTPS ポート。
 // 実績のある 8443 から順に試す。
 var altPorts = []string{"8443", "2053", "2083", "2087", "2096"}
 
+// 通らなかった道筋を候補から外しておく時間。
+const stageCooldown = 8 * time.Second
+
 // 一つの接続方法にかける待ち時間の上限。
 const methodBudget = 7 * time.Second
 
 // 道筋を並べて試すときは、次の道筋を始めるまでの間を空ける。
 // 前の道筋が通るまでの待ちを、そのまま空費にしない。
+// 道筋が多いときでも最後の一つまで予算の内に始められる間隔にする。
 const (
-	raceStagger = 800 * time.Millisecond
+	raceStagger = 400 * time.Millisecond
 	raceWidth   = 6
 )
 
@@ -156,20 +160,27 @@ func routeLabelText(route *routeCache) string {
 }
 
 // transportDialer は、道筋を順に試し、通った道筋を覚えておく。
-// 一度も通らないと分かった道筋は、この接続の間は飛ばす。
+// 通らなかった道筋はしばらく休ませるが、その記憶は方法ごとに分ける。
+// 通るかどうかは通信の形によって変わるため、別の方法の失敗を引きずらない。
 type transportDialer struct {
-	host string
-
-	mu   sync.Mutex
-	dead map[string]bool
-	good string
+	host   string
+	scope  string
+	shared *routepick.Shared
+	set    *routepick.Set
 }
 
 func newTransportDialer(host string) *transportDialer {
-	return &transportDialer{host: host, dead: map[string]bool{}}
+	shared := routepick.NewShared()
+	return &transportDialer{host: host, scope: "base", shared: shared, set: routepick.New(shared, stageCooldown)}
 }
 
-// order は、通った道筋を先頭に、使えないと分かっている道筋を外して並べる。
+// forMethod は、一つの方法だけの休みを持つ見方を返す。
+// 通った道筋の手がかりは、接続全体で共有する。
+func (d *transportDialer) forMethod(name string) *transportDialer {
+	return &transportDialer{host: d.host, scope: name, shared: d.shared, set: routepick.New(d.shared, stageCooldown)}
+}
+
+// order は、通った道筋を先頭に、休んでいる道筋を外して並べる。
 func (d *transportDialer) order(preferred []dialStage) []dialStage {
 	all := []dialStage{}
 	if st, ok := stageFromLabel(d.goodStage()); ok {
@@ -184,58 +195,43 @@ func (d *transportDialer) order(preferred []dialStage) []dialStage {
 func (d *transportDialer) only(stages []dialStage) []dialStage {
 	seen := map[string]bool{}
 	var all []dialStage
-	add := func(st dialStage) {
+	for _, st := range stages {
 		label := st.label()
 		if seen[label] {
-			return
+			continue
 		}
 		seen[label] = true
 		all = append(all, st)
 	}
-	for _, st := range stages {
-		add(st)
-	}
-	d.mu.Lock()
-	dead := make(map[string]bool, len(d.dead))
-	for key := range d.dead {
-		dead[key] = true
-	}
-	d.mu.Unlock()
-
-	out := make([]dialStage, 0, len(all))
+	labels := make([]string, 0, len(all))
+	keep := map[string]dialStage{}
 	for _, st := range all {
-		if dead[st.label()] {
-			continue
-		}
-		out = append(out, st)
+		labels = append(labels, st.label())
+		keep[st.label()] = st
+	}
+	out := make([]dialStage, 0, len(all))
+	for _, label := range d.set.Filter(labels) {
+		out = append(out, keep[label])
 	}
 	return out
 }
 
 func (d *transportDialer) isDead(label string) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.dead[label]
+	return d.set.Resting(label)
 }
 
+// markDead は、道筋をしばらく休ませる。通った道筋は休ませない。
 func (d *transportDialer) markDead(label string) {
-	d.mu.Lock()
-	d.dead[label] = true
-	d.mu.Unlock()
+	d.set.Rest(label)
 }
 
 func (d *transportDialer) markGood(label string) {
-	d.mu.Lock()
-	d.good = label
-	d.dead[label] = false
-	d.mu.Unlock()
+	d.set.Wake(label)
 }
 
 // goodStage は、この接続で通った道筋を返す。
 func (d *transportDialer) goodStage() string {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.good
+	return d.shared.Good()
 }
 
 // dialConn は、一つの道筋でつなぎ、必要なら TLS を張る。
@@ -311,6 +307,7 @@ func (d *transportDialer) dialRaw(ctx context.Context, st dialStage, port string
 }
 
 // anycastAddresses は、名前解決を避けてつなぐ先を返す。
+// 待たずに分かる住所を先に使い、照会はそれでも足りないときだけ行う。
 func (d *transportDialer) anycastAddresses(pinned string) []string {
 	var out []string
 	seen := map[string]bool{}
@@ -322,10 +319,17 @@ func (d *transportDialer) anycastAddresses(pinned string) []string {
 		out = append(out, ip)
 	}
 	add(pinned)
-	if ip, err := resolveDoH(d.host); err == nil {
+	if ip, ok := dohLookup.Cached(d.host); ok {
 		add(ip)
 	}
 	for _, ip := range cfAnycastIPs {
+		add(ip)
+	}
+	if len(out) > 0 {
+		return out
+	}
+	// 候補が一つも無いときだけ、実際に引く。
+	if ip, err := resolveDoH(d.host); err == nil {
 		add(ip)
 	}
 	return out
@@ -387,11 +391,24 @@ func raceStages[T interface{ Close() error }](parent context.Context, budget tim
 	var stopErr error
 	nextLaunch := time.Now()
 
+	// 道筋の試行で異常が出ても、本体を道連れにしない。
+	runAttempt := func(st dialStage) (v T, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				var zero T
+				v = zero
+				err = fmt.Errorf("%s: unexpected failure: %v", st.label(), r)
+				logf("route attempt stopped: %v", r)
+				writeCrashReport("route attempt", r)
+			}
+		}()
+		return attempt(ctx, st)
+	}
 	launch := func(st dialStage) {
 		launched++
 		active++
 		go func() {
-			v, err := attempt(ctx, st)
+			v, err := runAttempt(st)
 			if ctx.Err() != nil {
 				// 負けた道筋は、開いた接続ごと片付ける。
 				if err == nil {
