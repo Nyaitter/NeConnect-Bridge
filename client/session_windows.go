@@ -157,16 +157,6 @@ func (s *session) dialRoute(route routeCache, rawURL string) (*bridgeEngine, err
 	return newBridgeEngineForRoute(route, httpURL, pollURLFor(httpURL), s.signer)
 }
 
-func routeLabelText(route *routeCache) string {
-	if route == nil {
-		return "auto"
-	}
-	if route.Param != "" {
-		return route.Method + ":" + route.Param
-	}
-	return route.Method
-}
-
 func containsURL(list []string, want string) bool {
 	for _, item := range list {
 		if strings.TrimSpace(item) == want {

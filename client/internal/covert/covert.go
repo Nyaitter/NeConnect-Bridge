@@ -18,7 +18,8 @@ import (
 	"time"
 )
 
-// FragConn は最初の書き込みを小さく分割して送る接続。
+// FragConn は、最初の書き込みを細かく分けて送る接続。
+// 一続きの ClientHello として読まれないよう、TLS の記録ごとに二つへ割る。
 type FragConn struct {
 	net.Conn
 	once sync.Once
@@ -35,21 +36,62 @@ func (c *FragConn) Write(p []byte) (int, error) {
 		return c.Conn.Write(p)
 	}
 	total := 0
-	rest := p
-	for len(rest) > 0 {
-		size := 3
-		if len(rest) < size {
-			size = len(rest)
-		}
-		n, err := c.Conn.Write(rest[:size])
+	for _, part := range splitRecords(p) {
+		n, err := c.Conn.Write(part)
 		total += n
 		if err != nil {
 			return total, err
 		}
-		rest = rest[size:]
-		time.Sleep(2 * time.Millisecond)
 	}
 	return total, nil
+}
+
+// splitRecords は、TLS の記録を境目で二つに割る。
+// 記録として読めないデータは、同じくらいの三つに分ける。
+func splitRecords(p []byte) [][]byte {
+	var out [][]byte
+	rest := p
+	for len(rest) > 0 {
+		if len(rest) < 5 {
+			out = append(out, rest)
+			break
+		}
+		length := int(rest[3])<<8 | int(rest[4])
+		readable := rest[0] >= 20 && rest[0] <= 24 && rest[1] == 0x03 && length > 0 && length+5 <= len(rest)
+		if !readable {
+			out = append(out, splitEven(rest)...)
+			break
+		}
+		rec := rest[:5+length]
+		cut := 5 + randomOffset(length-1)
+		out = append(out, rec[:cut], rec[cut:])
+		rest = rest[5+length:]
+	}
+	if len(out) == 0 {
+		out = append(out, p)
+	}
+	return out
+}
+
+// randomOffset は、1 以上 span 以下の位置を返す。
+func randomOffset(span int) int {
+	if span <= 1 {
+		return span
+	}
+	var b [1]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return span / 2
+	}
+	return 1 + int(b[0])%span
+}
+
+// splitEven は、データを同じくらいの三つに分ける。
+func splitEven(p []byte) [][]byte {
+	if len(p) < 3 {
+		return [][]byte{p}
+	}
+	third := len(p) / 3
+	return [][]byte{p[:third], p[third : 2*third], p[2*third:]}
 }
 
 // DialFakeTLS は接続の先頭に TLS のやり取りを装ったやり取りを挟む。
