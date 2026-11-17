@@ -121,6 +121,15 @@ const (
 	idShortcutBtn   = 115
 	idLogBtn        = 116
 	idCacheBtn      = 117
+	idAdBlock       = 118
+	bsAutoCheckbox  = 0x0003
+	bmSetCheck      = 0x00F1
+	bmGetCheck      = 0x00F0
+	bnClicked       = 0
+	idYes           = 6
+	mbYesNo         = 0x00000004
+	mbIconQuestion  = 0x00000020
+	mbSetForeground = 0x00010000
 
 	wmAppStatus    = wmApp + 1
 	wmAppState     = wmApp + 2
@@ -192,11 +201,11 @@ type point struct {
 
 // minMaxInfo は、窓の大きさの上限と下限を渡すための形。
 type minMaxInfo struct {
-	reserved       point
-	maxSize        point
-	maxPosition    point
-	minTrackSize   point
-	maxTrackSize   point
+	reserved     point
+	maxSize      point
+	maxPosition  point
+	minTrackSize point
+	maxTrackSize point
 }
 
 type wndClassExW struct {
@@ -231,11 +240,19 @@ type uiHooks struct {
 	onCreateShortcut func(targetIdx int, appPath string)
 	onClearCache     func()
 	onOpenLog        func()
+	onToggleAdBlock  func(enabled bool)
 }
 
 type uiMessage struct {
 	title string
 	text  string
+}
+
+// uiConfirm は、画面に出す確認と、その答えの返し口。
+type uiConfirm struct {
+	title string
+	text  string
+	reply chan bool
 }
 
 type mainUI struct {
@@ -245,6 +262,7 @@ type mainUI struct {
 	runState     int
 	pendingURLs  []string
 	pendingErrs  []uiMessage
+	pendingAsk   []uiConfirm
 	logs         *logqueue.Queue
 	pendingPaths []string
 	logLines     []string
@@ -264,6 +282,7 @@ type mainUI struct {
 	shortcutBtn   uintptr
 	logBtn        uintptr
 	cacheBtn      uintptr
+	adblockBtn    uintptr
 
 	logHwnd uintptr
 	logEdit uintptr
@@ -489,6 +508,39 @@ func (u *mainUI) takeErrors() []uiMessage {
 	errs := u.pendingErrs
 	u.pendingErrs = nil
 	return errs
+}
+
+// askConfirm は、画面に「はい／いいえ」を出して答えを待つ。
+// 画面の流れが止まるのは待っている間だけで、接続はそのまま続く。
+func (u *mainUI) askConfirm(title, text string) bool {
+	reply := make(chan bool, 1)
+	u.mu.Lock()
+	if len(u.pendingAsk) < 4 {
+		u.pendingAsk = append(u.pendingAsk, uiConfirm{title: title, text: text, reply: reply})
+	}
+	u.mu.Unlock()
+	if u.windowHandle() == 0 {
+		return false
+	}
+	u.wake()
+	select {
+	case yes := <-reply:
+		return yes
+	case <-time.After(10 * time.Minute):
+		// 返事が無いまま止めない。次に起動したときから新しい版を使う。
+		return false
+	}
+}
+
+func (u *mainUI) takeConfirm() (uiConfirm, bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if len(u.pendingAsk) == 0 {
+		return uiConfirm{}, false
+	}
+	c := u.pendingAsk[0]
+	u.pendingAsk = u.pendingAsk[1:]
+	return c, true
 }
 
 func (u *mainUI) takeLogs() []string {
@@ -982,6 +1034,25 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 			for _, message := range ui.takeErrors() {
 				procMessageBoxW.Call(ui.hwnd, uintptr(unsafe.Pointer(u16(message.text))), uintptr(unsafe.Pointer(u16(message.title))), 0x10)
 			}
+			for {
+				ask, ok := ui.takeConfirm()
+				if !ok {
+					break
+				}
+				if !isWindowVisible(ui.hwnd) {
+					restoreFromTray()
+				}
+				answer, _, _ := procMessageBoxW.Call(
+					ui.hwnd,
+					uintptr(unsafe.Pointer(u16(ask.text))),
+					uintptr(unsafe.Pointer(u16(ask.title))),
+					uintptr(mbYesNo|mbIconQuestion|mbSetForeground),
+				)
+				select {
+				case ask.reply <- int(answer) == idYes:
+				default:
+				}
+			}
 			appendLogLines(ui.takeLogs())
 			return 0
 		case wmAppShowLog:
@@ -1073,6 +1144,14 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 					goSafe("clear cache", func() { ui.hooks.onClearCache() })
 				}
 				return 0
+			case idAdBlock:
+				if notif == bnClicked {
+					checked, _, _ := procSendMessageW.Call(ui.adblockBtn, bmGetCheck, 0, 0)
+					if ui.hooks.onToggleAdBlock != nil {
+						ui.hooks.onToggleAdBlock(checked == 1)
+					}
+				}
+				return 0
 			}
 			return 0
 		case wmSysCommand:
@@ -1130,7 +1209,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 
 	sw, _, _ := procGetSystemMetrics.Call(0)
 	sh, _, _ := procGetSystemMetrics.Call(1)
-	w, h := uintptr(470), uintptr(380)
+	w, h := uintptr(470), uintptr(422)
 	x := (sw - w) / 2
 	y := (sh - h) / 2
 
@@ -1192,7 +1271,20 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 	ui.shortcutBtn = mkButton(ui.hwnd, "ショートカットを作成", 150, 223, 190, 32, idShortcutBtn, hFont, hInst)
 	ui.logBtn = mkButton(ui.hwnd, "ログ", 350, 223, 85, 32, idLogBtn, hFont, hInst)
 
-	ui.statusLbl = mkLabel(ui.hwnd, "待機中", 20, 266, 415, 60, hFont, hInst)
+	ui.adblockBtn, _, _ = procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(u16("BUTTON"))),
+		uintptr(unsafe.Pointer(u16("広告ブロック"))),
+		wsChild|wsVisible|wsTabStop|bsAutoCheckbox,
+		20, 264, 200, 22,
+		ui.hwnd, idAdBlock, hInst, 0,
+	)
+	procSendMessageW.Call(ui.adblockBtn, wmSetFont, hFont, 1)
+	if cfg.AdBlock {
+		procSendMessageW.Call(ui.adblockBtn, bmSetCheck, 1, 0)
+	}
+
+	ui.statusLbl = mkLabel(ui.hwnd, "待機中", 20, 292, 415, 70, hFont, hInst)
 
 	procDragAcceptFiles.Call(ui.hwnd, 1)
 

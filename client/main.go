@@ -31,11 +31,15 @@ import (
 	"neconnectbridge/internal/httptunnel"
 	"neconnectbridge/internal/obfs"
 	"neconnectbridge/internal/rangetunnel"
+	"neconnectbridge/internal/selfupdate"
 	"neconnectbridge/internal/wsconn"
 )
 
 //go:embed id_ed25519_nctb
 var embeddedKey []byte
+
+// appVersion は、この実行ファイルの版。ビルドのときに package.json の値が入る。
+var appVersion = "0.0.0"
 
 // 中継の難読化に使う合言葉。自分のサーバーに合わせて差し替える。
 const obfsPassphrase = "replace-with-your-secret"
@@ -62,6 +66,7 @@ type Config struct {
 	TargetIdx int         `json:"target_idx"`
 	AppPath   string      `json:"app_path"`
 	URLSet    int         `json:"url_set"`
+	AdBlock   bool        `json:"adblock"`
 	Route     *routeCache `json:"last_route,omitempty"`
 }
 
@@ -87,7 +92,7 @@ func initLogger(dir string) {
 	if err == nil {
 		logFile = f
 		initCrashLog(dir)
-		logf("=== NeConnect Bridge started ===")
+		logf("=== NeConnect Bridge v%s を起動しました ===", appVersion)
 	}
 }
 
@@ -1324,7 +1329,7 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 		return cfg
 	}
 
-	persist := func(serverURLs string, targetIdx int, appPath string, route *routeCache) {
+	persist := func(serverURLs string, targetIdx int, appPath string, adblock bool, route *routeCache) {
 		cfgMu.Lock()
 		cfg = Config{
 			ClientID:  cfg.ClientID,
@@ -1332,6 +1337,7 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 			TargetIdx: targetIdx,
 			AppPath:   appPath,
 			URLSet:    cfg.URLSet,
+			AdBlock:   adblock,
 			Route:     route,
 		}
 		saved := cfg
@@ -1357,7 +1363,9 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 			globalUI.setRunState(true, false)
 			globalUI.setStatus("接続準備中...")
 			cur := readCfg()
-			persist(serverURLs, cur.TargetIdx, cur.AppPath, cur.Route)
+			persist(serverURLs, cur.TargetIdx, cur.AppPath, cur.AdBlock, cur.Route)
+			// 接続に使う名前は、広告ブロックの対象にしない。
+			setAdBlockHosts(serverURLs)
 			route, err := sess.connect(serverURLs, cur.Route, true, globalUI.setStatus)
 			if err != nil {
 				logf("connect failed: %v", err)
@@ -1366,11 +1374,27 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 				showError("NeConnect Bridge", fmt.Sprintf("%v", err))
 				return
 			}
-			persist(serverURLs, cur.TargetIdx, cur.AppPath, route)
+			persist(serverURLs, cur.TargetIdx, cur.AppPath, cur.AdBlock, route)
 			writeActiveSocks(dir, sess.socksPort(), routeLabelText(route))
 			globalUI.setRunState(false, true)
 			globalUI.setStatus("接続完了")
+			// つながったら、新しい版があるかを中継の上から確かめる。
+			startUpdateCheck(sess.socksPort(), serverURLs, func() {
+				sess.cleanup()
+				clearActiveSocks(dir)
+			})
 		}()
+	}
+
+	hooks.onToggleAdBlock = func(enabled bool) {
+		cur := readCfg()
+		persist(cur.ServerURL, cur.TargetIdx, cur.AppPath, enabled, cur.Route)
+		setAdBlockEnabled(enabled)
+		if enabled {
+			globalUI.setStatus(adBlockSummary())
+		} else {
+			globalUI.setStatus("広告ブロック: オフ")
+		}
 	}
 
 	hooks.onDisconnect = func() {
@@ -1403,7 +1427,9 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 				activeLaunch--
 				launchMu.Unlock()
 			}()
-			persist(serverURLs, targetIdx, appPath, readCfg().Route)
+			curForLaunch := readCfg()
+			persist(serverURLs, targetIdx, appPath, curForLaunch.AdBlock, curForLaunch.Route)
+			setAdBlockHosts(serverURLs)
 			req := launchRequest{kind: targetIdx, appPath: appPath}
 
 			port := 0
@@ -1423,7 +1449,7 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 					globalUI.setStatus("待機中 — 接続に失敗しました")
 					return
 				}
-				persist(serverURLs, targetIdx, appPath, route)
+				persist(serverURLs, targetIdx, appPath, curForLaunch.AdBlock, route)
 				port = own.socksPort()
 			}
 
@@ -1531,6 +1557,14 @@ func main() {
 	dir := exeDir()
 	initLogger(dir)
 	cfg := loadConfig(dir)
+	// 前回の差し替えで残ったものを片づける。
+	if self, err := os.Executable(); err == nil {
+		selfupdate.Cleanup(self)
+	}
+	setAdBlockHosts(cfg.ServerURL)
+	if cfg.AdBlock {
+		setAdBlockEnabled(true)
+	}
 	signer, err := ssh.ParsePrivateKey(embeddedKey)
 	if err != nil {
 		logf("Failed to parse embedded key: %v", err)

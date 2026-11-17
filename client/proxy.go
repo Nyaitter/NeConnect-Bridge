@@ -138,6 +138,13 @@ func handleSOCKS5(c net.Conn, dialTarget func(string) (net.Conn, error), pool *s
 	port := binary.BigEndian.Uint16(pb)
 	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
+	// 広告の配信元なら、中継へ流さずここで断る。
+	if shouldBlockHost(host) {
+		noteAdBlockHit(host)
+		_, _ = c.Write([]byte{0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
 	remote, err := dialTarget(target)
 	if err != nil {
 		logf("SOCKS5 dialTarget %s failed: %v", target, err)
@@ -182,6 +189,12 @@ func handleSOCKS4(c net.Conn, dialTarget func(string) (net.Conn, error), pool *s
 		host = name
 	}
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
+
+	if shouldBlockHost(host) {
+		noteAdBlockHit(host)
+		_, _ = c.Write([]byte{0x00, 0x5B, 0, 0, 0, 0, 0, 0})
+		return
+	}
 
 	remote, err := dialTarget(target)
 	if err != nil {
@@ -231,6 +244,11 @@ func handleHTTPProxy(c *bufferedConn, br *bufio.Reader, dialTarget func(string) 
 		if _, _, serr := net.SplitHostPort(addr); serr != nil {
 			addr = net.JoinHostPort(strings.Trim(addr, "[]"), "443")
 		}
+		if shouldBlockHost(addr) {
+			noteAdBlockHit(addr)
+			writeHTTPError(c, 403, "Forbidden")
+			return
+		}
 		remote, derr := dialTarget(addr)
 		if derr != nil {
 			logf("HTTP CONNECT %s failed: %v", addr, derr)
@@ -269,6 +287,12 @@ func handleHTTPProxy(c *bufferedConn, br *bufio.Reader, dialTarget func(string) 
 	addr := host
 	if _, _, serr := net.SplitHostPort(addr); serr != nil {
 		addr = net.JoinHostPort(strings.Trim(addr, "[]"), port)
+	}
+
+	if shouldBlockHost(host) {
+		noteAdBlockHit(host)
+		writeHTTPError(c, 403, "Forbidden")
+		return
 	}
 
 	remote, derr := dialTarget(addr)

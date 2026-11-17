@@ -666,7 +666,7 @@ const server = http.createServer(async (req, res) => {
       const all = releases.list();
       json(res, 200, {
         latest: all.length > 0 ? all[0].version : null,
-        versions: all.map((item) => ({ version: item.version, size: item.size, released_at: item.released_at })),
+        versions: all.map((item) => ({ version: item.version, size: item.size, sha256: item.sha256, released_at: item.released_at })),
       });
       return;
     }
@@ -842,7 +842,7 @@ const server = http.createServer(async (req, res) => {
         max_clients: pool.maxClients,
         tunnels: tunnels.active(),
         bridges: pool.list(),
-        releases: releases.list().map((item) => ({ version: item.version, size: item.size })),
+        releases: releases.list().map((item) => ({ version: item.version, size: item.size, sha256: item.sha256 })),
         uptime_seconds: Math.round(process.uptime()),
       });
       return;
