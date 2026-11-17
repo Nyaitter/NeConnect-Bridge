@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -30,6 +31,24 @@ class ReleaseStore {
     this.releasesDir = releasesDir;
     this.fallbackExe = fallbackExe;
     this.fallbackVersion = fallbackVersion || '1.0.0';
+    // 同じファイルを何度も読み直さないよう、照合値は更新日時と大きさで覚えておく。
+    this.digests = new Map();
+  }
+
+  // sha256Of は、配布物の中身の照合値を返す。読めないときは null。
+  sha256Of(file, stat) {
+    const cached = this.digests.get(file);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      return cached.sha256;
+    }
+    let sha256;
+    try {
+      sha256 = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+    } catch {
+      return null;
+    }
+    this.digests.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, sha256 });
+    return sha256;
   }
 
   list() {
@@ -55,6 +74,7 @@ class ReleaseStore {
         version: match[1],
         file,
         size: stat.size,
+        sha256: this.sha256Of(file, stat),
         released_at: new Date(stat.mtimeMs).toISOString(),
       });
     }
@@ -66,6 +86,7 @@ class ReleaseStore {
             version: this.fallbackVersion,
             file: this.fallbackExe,
             size: stat.size,
+            sha256: this.sha256Of(this.fallbackExe, stat),
             released_at: new Date(stat.mtimeMs).toISOString(),
           });
         }
