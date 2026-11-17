@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,13 +21,12 @@ type session struct {
 	dir    string
 	signer ssh.Signer
 
-	mu        sync.Mutex
-	eng       *bridgeEngine
-	ln        net.Listener
-	backup    *sysProxyBackup
-	modeLabel string
-	port      int
-	closed    bool
+	mu     sync.Mutex
+	eng    *bridgeEngine
+	ln     net.Listener
+	backup *sysProxyBackup
+	port   int
+	closed bool
 }
 
 func newSession(dir string, signer ssh.Signer) *session {
@@ -46,51 +46,78 @@ func (s *session) connected() bool {
 }
 
 // connect はブリッジへ接続し、ローカルの入口を開く。
-func (s *session) connect(serverURLs string, modeIdx int, withSystemProxy bool, setStatus func(string)) error {
-	modeChoices := []string{"auto", "speed", "balance", "secure"}
-	modeLabels := map[string]string{"auto": "オート", "speed": "スピード", "balance": "バランス", "secure": "セキュア"}
-	if modeIdx < 0 || modeIdx >= len(modeChoices) {
-		modeIdx = 0
-	}
+// 前回つながった経路があれば、それを先に試す。
+func (s *session) connect(serverURLs string, cached *routeCache, withSystemProxy bool, setStatus func(string)) (*routeCache, error) {
 	if setStatus == nil {
 		setStatus = func(string) {}
 	}
-	selectedMode := modeChoices[modeIdx]
 	urlList := splitServerURLs(serverURLs)
-	logf("Connect start: mode=%s urls=%v", selectedMode, urlList)
+	if len(urlList) == 0 {
+		return nil, fmt.Errorf("ブリッジURLが指定されていません")
+	}
+	logf("Connect start: urls=%v", urlList)
 
 	var eng *bridgeEngine
-	var label string
+	var route *routeCache
 	var allErrs []string
 
-	for idx, rawURL := range urlList {
-		_, httpURL, uerr := toWSURL(rawURL, "balance")
-		if uerr != nil {
-			allErrs = append(allErrs, rawURL+": "+uerr.Error())
-			continue
+	// 前回の経路を先に試す。
+	if cached != nil {
+		raw := strings.TrimSpace(cached.URL)
+		switch {
+		case raw == "" || cached.Method == "":
+			// 手がかりがないときは何もしない。
+		case !containsURL(urlList, raw):
+			logf("cached route skipped: %s is not in the list", raw)
+		default:
+			setStatus("前回の接続先で接続中...")
+			e, cerr := s.dialRoute(*cached, raw)
+			if cerr != nil {
+				logf("cached route failed: %v", cerr)
+				allErrs = append(allErrs, "cached: "+cerr.Error())
+			} else {
+				eng = e
+				saved := *cached
+				route = &saved
+				logf("connected via %s", routeLabelText(route))
+			}
 		}
-		setStatus(fmt.Sprintf("%sモードで接続中... [%d/%d]", modeLabels[selectedMode], idx+1, len(urlList)))
-		pollURL := trimServerSuffix(httpURL) + "/poll"
-		e, cerr := newBridgeEngine(selectedMode, httpURL, pollURL, s.signer)
-		if cerr == nil {
-			eng = e
-			label = modeLabels[selectedMode]
-			break
-		}
-		logf("URL %s failed (%s): %v", rawURL, selectedMode, cerr)
-		allErrs = append(allErrs, rawURL+"["+selectedMode+"]: "+cerr.Error())
 	}
 
 	if eng == nil {
-		return fmt.Errorf("接続に失敗しました [%s]:\n%v", modeLabels[selectedMode], allErrs)
+		for idx, rawURL := range urlList {
+			_, httpURL, uerr := toWSURL(rawURL, "auto")
+			if uerr != nil {
+				allErrs = append(allErrs, rawURL+": "+uerr.Error())
+				continue
+			}
+			setStatus(fmt.Sprintf("接続中... [%d/%d]", idx+1, len(urlList)))
+			e, cerr := newBridgeEngine(httpURL, pollURLFor(httpURL), s.signer)
+			if cerr == nil {
+				eng = e
+				route = e.routeCacheFor(rawURL)
+				logf("connected via %s", routeLabelText(route))
+				break
+			}
+			logf("URL %s failed: %v", rawURL, cerr)
+			allErrs = append(allErrs, rawURL+": "+cerr.Error())
+		}
+	}
+
+	if eng == nil {
+		return nil, fmt.Errorf("接続に失敗しました:\n%s", strings.Join(allErrs, "\n"))
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		eng.close()
-		return fmt.Errorf("ローカル接続口を確保できませんでした: %v", err)
+		return nil, fmt.Errorf("ローカル接続口を確保できませんでした: %v", err)
 	}
-	go serveSOCKS5(ln, eng)
+	pool := &bufPool64
+	if eng.pool != nil {
+		pool = &bufPool256
+	}
+	go serveLocalProxy(ln, eng.dialTarget, pool)
 
 	addr, _ := ln.Addr().(*net.TCPAddr)
 	port := 0
@@ -102,24 +129,51 @@ func (s *session) connect(serverURLs string, modeIdx int, withSystemProxy bool, 
 	s.eng = eng
 	s.ln = ln
 	s.port = port
-	s.modeLabel = label
 	s.closed = false
 	s.mu.Unlock()
 
-	logf("Local entry ready on 127.0.0.1:%d [%s]", port, label)
+	logf("Local entry ready on 127.0.0.1:%d", port)
 
 	if withSystemProxy {
 		setStatus("まわりのアプリにも反映しています...")
 		bk, berr := setSystemSOCKSProxy(ln.Addr().String())
 		if berr != nil {
-			logf("setSystemSOCKSProxy failed: %v", berr)
+			logf("system proxy setting failed: %v", berr)
 		} else {
 			s.mu.Lock()
 			s.backup = bk
 			s.mu.Unlock()
 		}
 	}
-	return nil
+	return route, nil
+}
+
+// dialRoute は、保存した経路だけで接続を試す。
+func (s *session) dialRoute(route routeCache, rawURL string) (*bridgeEngine, error) {
+	_, httpURL, uerr := toWSURL(rawURL, "auto")
+	if uerr != nil {
+		return nil, uerr
+	}
+	return newBridgeEngineForRoute(route, httpURL, pollURLFor(httpURL), s.signer)
+}
+
+func routeLabelText(route *routeCache) string {
+	if route == nil {
+		return "auto"
+	}
+	if route.Param != "" {
+		return route.Method + ":" + route.Param
+	}
+	return route.Method
+}
+
+func containsURL(list []string, want string) bool {
+	for _, item := range list {
+		if strings.TrimSpace(item) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // cleanup は接続を閉じ、必要なら元の状態へ戻す。
@@ -154,13 +208,6 @@ func (s *session) cleanup() {
 			bk.restore()
 		}
 	})
-}
-
-func trimServerSuffix(u string) string {
-	if len(u) >= 7 && u[len(u)-7:] == "/server" {
-		return u[:len(u)-7]
-	}
-	return u
 }
 
 // ---- 共有情報ファイル -------------------------------------------------

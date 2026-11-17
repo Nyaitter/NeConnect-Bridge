@@ -44,13 +44,21 @@ const (
 	browserUA              = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
+// routeCache は、前回つながった経路の手がかり。
+type routeCache struct {
+	URL    string `json:"url"`
+	Method string `json:"method"`
+	Param  string `json:"param,omitempty"`
+	At     string `json:"at,omitempty"`
+}
+
 type Config struct {
-	ClientID  string `json:"client_id"`
-	ServerURL string `json:"server_url"`
-	ModeIdx   int    `json:"mode_idx"`
-	TargetIdx int    `json:"target_idx"`
-	AppPath   string `json:"app_path"`
-	URLSet    int    `json:"url_set"`
+	ClientID  string      `json:"client_id"`
+	ServerURL string      `json:"server_url"`
+	TargetIdx int         `json:"target_idx"`
+	AppPath   string      `json:"app_path"`
+	URLSet    int         `json:"url_set"`
+	Route     *routeCache `json:"last_route,omitempty"`
 }
 
 var (
@@ -104,7 +112,6 @@ const urlSetVersion = 2
 func loadConfig(dir string) Config {
 	cfg := Config{
 		ServerURL: defaultMultiURLs,
-		ModeIdx:   0,
 		TargetIdx: targetBrowser,
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "nctb_config.json"))
@@ -130,9 +137,6 @@ func loadConfig(dir string) Config {
 	}
 	if cfg.TargetIdx < 0 || cfg.TargetIdx > targetApp {
 		cfg.TargetIdx = targetBrowser
-	}
-	if cfg.ModeIdx < 0 || cfg.ModeIdx > 3 {
-		cfg.ModeIdx = 0
 	}
 	return cfg
 }
@@ -469,19 +473,35 @@ func toWSURL(rawURL, mode string) (string, string, error) {
 	return u.String(), httpURL, nil
 }
 
+// pollURLFor は、ブリッジURLからポーリング用のURLを作る。
+func pollURLFor(httpURL string) string {
+	u, err := url.Parse(httpURL)
+	if err != nil {
+		return ""
+	}
+	path := strings.TrimSuffix(u.Path, "/server")
+	if path == "" {
+		path = "/bridge"
+	}
+	u.Path = path + "/poll"
+	u.RawQuery = ""
+	return u.String()
+}
+
 type bridgeEngine struct {
-	mode      string
-	methods   []connMethod
-	wsBase    string
-	pollURL   string
-	sshCfg    *ssh.ClientConfig
-	dialer    *websocket.Dialer
-	dohDialer *websocket.Dialer
-	mu        sync.Mutex
-	sshClient *ssh.Client
-	pool      chan net.Conn
-	stopCh    chan struct{}
-	closed    bool
+	methods     []connMethod
+	preferParam string
+	routeLabel  string
+	wsBase      string
+	pollURL     string
+	sshCfg      *ssh.ClientConfig
+	dialer      *websocket.Dialer
+	dohDialer   *websocket.Dialer
+	mu          sync.Mutex
+	sshClient   *ssh.Client
+	pool        chan net.Conn
+	stopCh      chan struct{}
+	closed      bool
 }
 
 type methodKind int
@@ -505,7 +525,7 @@ type connMethod struct {
 }
 
 // connectionMethods は速い順に並べた接続方法の一覧。
-// 各モードはこの一覧の範囲を選ぶだけで、個別の処理は持たない。
+// いつもこの順に試す。
 var connectionMethods = []connMethod{
 	{"wsPool", methodWSPool},
 	{"wsTunnel", methodWSTunnel},
@@ -519,24 +539,22 @@ var connectionMethods = []connMethod{
 	{"assetCookie", methodAssetCookie},
 }
 
-func methodsForMode(mode string) []connMethod {
-	switch mode {
-	case "speed":
-		return speedMethods
-	case "balance":
-		return balanceMethods
-	case "secure":
-		return secureMethods
+func methodByName(name string) (connMethod, bool) {
+	for _, m := range connectionMethods {
+		if m.name == name {
+			return m, true
+		}
 	}
-	return connectionMethods
+	return connMethod{}, false
 }
 
-// 各モードは、速い順の一覧のどの範囲を使うかだけを決める。
-var (
-	speedMethods   = connectionMethods[:2]
-	balanceMethods = connectionMethods[:5]
-	secureMethods  = connectionMethods[2:]
-)
+// splitRouteLabel は「altPorts:8443」のような手がかりを分解する。
+func splitRouteLabel(label string) (string, string) {
+	if i := strings.Index(label, ":"); i >= 0 {
+		return label[:i], label[i+1:]
+	}
+	return label, ""
+}
 
 func officialHostKeyCallback() ssh.HostKeyCallback {
 	if strings.TrimSpace(officialSSHHostKeyLine) == "" {
@@ -551,11 +569,9 @@ func officialHostKeyCallback() ssh.HostKeyCallback {
 	return ssh.FixedHostKey(pk)
 }
 
-func newBridgeEngine(mode, wsBase, pollURL string, signer ssh.Signer) (*bridgeEngine, error) {
+func newEngineBase(wsBase, pollURL string, signer ssh.Signer) *bridgeEngine {
 	netDialer := &net.Dialer{Timeout: 6 * time.Second}
 	e := &bridgeEngine{
-		mode:    mode,
-		methods: methodsForMode(mode),
 		wsBase:  wsBase,
 		pollURL: pollURL,
 		sshCfg: &ssh.ClientConfig{
@@ -591,12 +607,19 @@ func newBridgeEngine(mode, wsBase, pollURL string, signer ssh.Signer) (*bridgeEn
 		},
 		stopCh: make(chan struct{}),
 	}
+	return e
+}
+
+// newBridgeEngine は、速い順にすべての方法を試せる状態で組み立てる。
+func newBridgeEngine(wsBase, pollURL string, signer ssh.Signer) (*bridgeEngine, error) {
+	e := newEngineBase(wsBase, pollURL, signer)
+	e.methods = connectionMethods
 
 	if len(e.methods) > 0 && e.methods[0].kind == methodWSPool {
 		if e.wsBase == "" {
 			e.methods = e.methods[1:]
 			if len(e.methods) == 0 {
-				return nil, errors.New("this mode needs a bridge url")
+				return nil, errors.New("bridge url is required")
 			}
 		}
 	}
@@ -616,6 +639,32 @@ func newBridgeEngine(mode, wsBase, pollURL string, signer ssh.Signer) (*bridgeEn
 		go e.sshKeepaliveLoop()
 	}
 
+	return e, nil
+}
+
+// newBridgeEngineForRoute は、前回つながった経路だけを試す。
+func newBridgeEngineForRoute(route routeCache, wsBase, pollURL string, signer ssh.Signer) (*bridgeEngine, error) {
+	m, ok := methodByName(route.Method)
+	if !ok {
+		return nil, fmt.Errorf("unknown route: %s", route.Method)
+	}
+	e := newEngineBase(wsBase, pollURL, signer)
+	e.methods = []connMethod{m}
+	e.preferParam = route.Param
+
+	if m.kind == methodWSPool {
+		if e.wsBase == "" {
+			return nil, errors.New("bridge url is required")
+		}
+		if err := e.warmPool(); err != nil {
+			return nil, err
+		}
+		return e, nil
+	}
+	if err := e.ensureSSH(); err != nil {
+		return nil, err
+	}
+	go e.sshKeepaliveLoop()
 	return e, nil
 }
 
@@ -661,8 +710,35 @@ func (e *bridgeEngine) warmPool() error {
 		return firstErr
 	}
 	logf("wsPool connected with %d streams", len(e.pool))
+	e.noteRoute("wsPool")
 	go e.refillLoop()
 	return nil
+}
+
+// noteRoute は、実際につながった経路を覚えておく。
+func (e *bridgeEngine) noteRoute(label string) {
+	e.mu.Lock()
+	if e.routeLabel == "" {
+		e.routeLabel = label
+	}
+	e.mu.Unlock()
+}
+
+// routeCacheFor は、保存しておく手がかりをまとめる。
+func (e *bridgeEngine) routeCacheFor(rawURL string) *routeCache {
+	e.mu.Lock()
+	label := e.routeLabel
+	e.mu.Unlock()
+	if label == "" {
+		return nil
+	}
+	method, param := splitRouteLabel(label)
+	return &routeCache{
+		URL:    strings.TrimSpace(rawURL),
+		Method: method,
+		Param:  param,
+		At:     time.Now().Format(time.RFC3339),
+	}
 }
 
 func (e *bridgeEngine) rawWSURL(mode string) (string, error) {
@@ -747,8 +823,9 @@ func (e *bridgeEngine) dialSSHTransport() (*ssh.Client, error) {
 		if m.kind == methodWSPool {
 			continue
 		}
-		c, err := e.dialMethod(m)
+		c, label, err := e.dialMethod(m)
 		if err == nil {
+			e.noteRoute(label)
 			return c, nil
 		}
 		errs = append(errs, m.name+": "+err.Error())
@@ -756,36 +833,45 @@ func (e *bridgeEngine) dialSSHTransport() (*ssh.Client, error) {
 	return nil, errors.New(strings.Join(errs, "\n"))
 }
 
-func (e *bridgeEngine) dialMethod(m connMethod) (*ssh.Client, error) {
+func (e *bridgeEngine) dialMethod(m connMethod) (*ssh.Client, string, error) {
 	switch m.kind {
 	case methodWSTunnel:
-		return e.tryObfsSSH(m.name, func() (net.Conn, error) {
+		c, err := e.tryObfsSSH(m.name, func() (net.Conn, error) {
 			return e.dialRawWS("secure", false)
 		})
+		return c, m.name, err
 	case methodDoHWS:
-		return e.tryObfsSSH(m.name, func() (net.Conn, error) {
+		c, err := e.tryObfsSSH(m.name, func() (net.Conn, error) {
 			return e.dialRawWS("secure", true)
 		})
+		return c, m.name, err
 	case methodHTTPPoll:
-		return e.tryObfsSSH(m.name, func() (net.Conn, error) {
+		c, err := e.tryObfsSSH(m.name, func() (net.Conn, error) {
 			return httptunnel.Dial(e.pollURL, makeDoHHTTPClient(35*time.Second))
 		})
+		return c, m.name, err
 	case methodCFDirectWS:
-		return e.dialCFDirectWS(m.name)
+		c, label, err := e.dialCFDirectWS(m.name)
+		return c, label, err
 	case methodCFDirectPoll:
-		return e.dialCFDirectPoll(m.name)
+		c, label, err := e.dialCFDirectPoll(m.name)
+		return c, label, err
 	case methodTLSFrag:
-		return e.tryObfsSSH(m.name, func() (net.Conn, error) {
+		c, err := e.tryObfsSSH(m.name, func() (net.Conn, error) {
 			return e.dialFragWS()
 		})
+		return c, m.name, err
 	case methodAltPorts:
-		return e.dialAltPorts(m.name)
+		c, label, err := e.dialAltPorts(m.name)
+		return c, label, err
 	case methodSSEForm:
-		return e.dialSSEForm(m.name)
+		c, err := e.dialSSEForm(m.name)
+		return c, m.name, err
 	case methodAssetCookie:
-		return e.dialAssetCookie(m.name)
+		c, err := e.dialAssetCookie(m.name)
+		return c, m.name, err
 	}
-	return nil, fmt.Errorf("unsupported method: %s", m.name)
+	return nil, "", fmt.Errorf("unsupported method: %s", m.name)
 }
 
 func (e *bridgeEngine) origin() (string, error) {
@@ -836,15 +922,19 @@ func (e *bridgeEngine) dialFragWS() (net.Conn, error) {
 	return wsconn.Wrap(ws), nil
 }
 
-func (e *bridgeEngine) dialAltPorts(name string) (*ssh.Client, error) {
+func (e *bridgeEngine) dialAltPorts(name string) (*ssh.Client, string, error) {
 	if e.wsBase == "" {
-		return nil, errors.New("bridge url is empty")
+		return nil, "", errors.New("bridge url is empty")
+	}
+	ports := []string{"2053", "2083", "2087", "2096", "8443"}
+	if e.preferParam != "" {
+		ports = []string{e.preferParam}
 	}
 	var errs []string
-	for _, port := range []string{"2053", "2083", "2087", "2096", "8443"} {
+	for _, port := range ports {
 		alt, err := covert.AltPortURL(e.wsBase, port)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		address, _, err := toWSURL(alt, "secure")
 		if err != nil {
@@ -855,11 +945,11 @@ func (e *bridgeEngine) dialAltPorts(name string) (*ssh.Client, error) {
 			return e.dialWebSocketURL(address)
 		})
 		if cerr == nil {
-			return c, nil
+			return c, label, nil
 		}
 		errs = append(errs, cerr.Error())
 	}
-	return nil, errors.New(strings.Join(errs, "\n"))
+	return nil, "", errors.New(strings.Join(errs, "\n"))
 }
 
 func (e *bridgeEngine) dialSSEForm(name string) (*ssh.Client, error) {
@@ -882,13 +972,17 @@ func (e *bridgeEngine) dialAssetCookie(name string) (*ssh.Client, error) {
 	})
 }
 
-func (e *bridgeEngine) dialCFDirectWS(name string) (*ssh.Client, error) {
+func (e *bridgeEngine) dialCFDirectWS(name string) (*ssh.Client, string, error) {
 	wsURL, err := e.rawWSURL("secure")
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	ips := cfAnycastIPs
+	if e.preferParam != "" {
+		ips = []string{e.preferParam}
 	}
 	var errs []string
-	for _, cfIP := range cfAnycastIPs {
+	for _, cfIP := range ips {
 		ip := cfIP
 		cfDialer := &websocket.Dialer{
 			HandshakeTimeout: 6 * time.Second,
@@ -910,29 +1004,33 @@ func (e *bridgeEngine) dialCFDirectWS(name string) (*ssh.Client, error) {
 			return wsconn.Wrap(ws), nil
 		})
 		if err == nil {
-			return c, nil
+			return c, name + ":" + ip, nil
 		}
 		errs = append(errs, err.Error())
 	}
-	return nil, errors.New(strings.Join(errs, "\n"))
+	return nil, "", errors.New(strings.Join(errs, "\n"))
 }
 
-func (e *bridgeEngine) dialCFDirectPoll(name string) (*ssh.Client, error) {
+func (e *bridgeEngine) dialCFDirectPoll(name string) (*ssh.Client, string, error) {
 	if e.pollURL == "" {
-		return nil, errors.New("poll url is empty")
+		return nil, "", errors.New("poll url is empty")
+	}
+	ips := cfAnycastIPs
+	if e.preferParam != "" {
+		ips = []string{e.preferParam}
 	}
 	var errs []string
-	for _, cfIP := range cfAnycastIPs {
+	for _, cfIP := range ips {
 		ip := cfIP
 		c, err := e.tryObfsSSH(name+":"+ip, func() (net.Conn, error) {
 			return httptunnel.Dial(e.pollURL, makeCFDirectHTTPClient(35*time.Second, ip))
 		})
 		if err == nil {
-			return c, nil
+			return c, name + ":" + ip, nil
 		}
 		errs = append(errs, err.Error())
 	}
-	return nil, errors.New(strings.Join(errs, "\n"))
+	return nil, "", errors.New(strings.Join(errs, "\n"))
 }
 
 func (e *bridgeEngine) ensureSSH() error {
@@ -1161,129 +1259,6 @@ func (e *bridgeEngine) close() {
 	}
 }
 
-func serveSOCKS5(ln net.Listener, eng *bridgeEngine) {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		if tc, ok := conn.(*net.TCPConn); ok {
-			_ = tc.SetNoDelay(true)
-		}
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					logf("socks connection stopped: %v", r)
-				}
-			}()
-			handleSOCKS5(conn, eng)
-		}()
-	}
-}
-
-func handleSOCKS5(c net.Conn, eng *bridgeEngine) {
-	defer c.Close()
-
-	// 何も送ってこない相手につながったままにしない。
-	_ = c.SetDeadline(time.Now().Add(30 * time.Second))
-
-	hdr := make([]byte, 2)
-	if _, err := io.ReadFull(c, hdr); err != nil || hdr[0] != 0x05 {
-		return
-	}
-	methods := make([]byte, int(hdr[1]))
-	if _, err := io.ReadFull(c, methods); err != nil {
-		return
-	}
-	if _, err := c.Write([]byte{0x05, 0x00}); err != nil {
-		return
-	}
-
-	req := make([]byte, 4)
-	if _, err := io.ReadFull(c, req); err != nil {
-		return
-	}
-	if req[0] != 0x05 || req[1] != 0x01 {
-		_, _ = c.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
-
-	var host string
-	switch req[3] {
-	case 0x01:
-		buf := make([]byte, 4)
-		if _, err := io.ReadFull(c, buf); err != nil {
-			return
-		}
-		host = net.IP(buf).String()
-	case 0x03:
-		lb := make([]byte, 1)
-		if _, err := io.ReadFull(c, lb); err != nil {
-			return
-		}
-		buf := make([]byte, int(lb[0]))
-		if _, err := io.ReadFull(c, buf); err != nil {
-			return
-		}
-		host = string(buf)
-	case 0x04:
-		buf := make([]byte, 16)
-		if _, err := io.ReadFull(c, buf); err != nil {
-			return
-		}
-		host = net.IP(buf).String()
-	default:
-		_, _ = c.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
-
-	pb := make([]byte, 2)
-	if _, err := io.ReadFull(c, pb); err != nil {
-		return
-	}
-	port := binary.BigEndian.Uint16(pb)
-	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-
-	remote, err := eng.dialTarget(target)
-	if err != nil {
-		logf("SOCKS5 dialTarget %s failed: %v", target, err)
-		_, _ = c.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
-	defer remote.Close()
-
-	if _, err := c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
-		return
-	}
-	_ = c.SetDeadline(time.Time{})
-
-	pool := &bufPool64
-	if eng.pool != nil {
-		pool = &bufPool256
-	}
-	var wg sync.WaitGroup
-	wg.Add(2)
-	copyFn := func(tag string, dst, src net.Conn) {
-		defer wg.Done()
-		defer func() {
-			if r := recover(); r != nil {
-				logf("SOCKS5 %s copy %s stopped: %v", target, tag, r)
-			}
-		}()
-		bp := pool.Get().(*[]byte)
-		n, cerr := io.CopyBuffer(dst, src, *bp)
-		pool.Put(bp)
-		if cerr != nil {
-			logf("SOCKS5 %s copy %s ended after %d bytes: %v", target, tag, n, cerr)
-		}
-		_ = dst.Close()
-		_ = src.Close()
-	}
-	go copyFn("up", remote, c)
-	go copyFn("down", c, remote)
-	wg.Wait()
-}
-
 // runBounded は fn を別ゴルーチンで実行し、上限時間を過ぎたら切り上げる。
 // 応答しないネットワークやレジストリ操作でアプリ全体が固まるのを防ぐ。
 func runBounded(name string, limit time.Duration, fn func()) {
@@ -1371,7 +1346,7 @@ func runLaunchMode(dir string, cfg Config, signer ssh.Signer, req launchRequest)
 		logf("launch: using running entry port=%d", port)
 	} else {
 		own = newSession(dir, signer)
-		if err := own.connect(cfg.ServerURL, cfg.ModeIdx, false, status); err != nil {
+		if _, err := own.connect(cfg.ServerURL, cfg.Route, false, status); err != nil {
 			logf("launch connect failed: %v", err)
 			showError("NeConnect Bridge", fmt.Sprintf("接続できませんでした:\n%v", err))
 			return
@@ -1401,25 +1376,36 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 
 	var launchMu sync.Mutex
 	activeLaunch := 0
+	var cfgMu sync.Mutex
 
-	persist := func(serverURLs string, modeIdx, targetIdx int, appPath string) {
+	readCfg := func() Config {
+		cfgMu.Lock()
+		defer cfgMu.Unlock()
+		return cfg
+	}
+
+	persist := func(serverURLs string, targetIdx int, appPath string, route *routeCache) {
+		cfgMu.Lock()
 		cfg = Config{
 			ClientID:  cfg.ClientID,
 			ServerURL: serverURLs,
-			ModeIdx:   modeIdx,
 			TargetIdx: targetIdx,
 			AppPath:   appPath,
+			URLSet:    cfg.URLSet,
+			Route:     route,
 		}
-		saveConfig(dir, cfg)
+		saved := cfg
+		cfgMu.Unlock()
+		saveConfig(dir, saved)
 	}
 
 	hooks := uiHooks{}
 
 	generateURL = func(currentURLs string) {
-		generateURLImpl(dir, cfg, signer, currentURLs)
+		generateURLImpl(dir, readCfg(), signer, currentURLs)
 	}
 
-	hooks.onConnect = func(serverURLs string, modeIdx int) {
+	hooks.onConnect = func(serverURLs string) {
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -1430,17 +1416,20 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 			}()
 			globalUI.setRunState(true, false)
 			globalUI.setStatus("接続準備中...")
-			persist(serverURLs, modeIdx, cfg.TargetIdx, cfg.AppPath)
-			if err := sess.connect(serverURLs, modeIdx, true, globalUI.setStatus); err != nil {
+			cur := readCfg()
+			persist(serverURLs, cur.TargetIdx, cur.AppPath, cur.Route)
+			route, err := sess.connect(serverURLs, cur.Route, true, globalUI.setStatus)
+			if err != nil {
 				logf("connect failed: %v", err)
 				globalUI.setRunState(false, false)
 				globalUI.setStatus("待機中 — 接続に失敗しました")
 				showError("NeConnect Bridge", fmt.Sprintf("%v", err))
 				return
 			}
-			writeActiveSocks(dir, sess.socksPort(), sess.modeLabel)
+			persist(serverURLs, cur.TargetIdx, cur.AppPath, route)
+			writeActiveSocks(dir, sess.socksPort(), routeLabelText(route))
 			globalUI.setRunState(false, true)
-			globalUI.setStatus(fmt.Sprintf("接続中 [%s]", sess.modeLabel))
+			globalUI.setStatus("接続中")
 		}()
 	}
 
@@ -1454,7 +1443,7 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 		}()
 	}
 
-	hooks.onLaunch = func(targetIdx int, appPath, serverURLs string, modeIdx int) {
+	hooks.onLaunch = func(targetIdx int, appPath, serverURLs string) {
 		launchMu.Lock()
 		if activeLaunch > 0 {
 			launchMu.Unlock()
@@ -1474,7 +1463,7 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 				activeLaunch--
 				launchMu.Unlock()
 			}()
-			persist(serverURLs, modeIdx, targetIdx, appPath)
+			persist(serverURLs, targetIdx, appPath, readCfg().Route)
 			req := launchRequest{kind: targetIdx, appPath: appPath}
 
 			port := 0
@@ -1487,12 +1476,14 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 			if port == 0 {
 				own = newSession(dir, signer)
 				globalUI.setStatus("接続しています...")
-				if err := own.connect(serverURLs, modeIdx, false, globalUI.setStatus); err != nil {
-					logf("launch connect failed: %v", err)
-					showError("NeConnect Bridge", fmt.Sprintf("接続できませんでした:\n%v", err))
+				route, cerr := own.connect(serverURLs, readCfg().Route, false, globalUI.setStatus)
+				if cerr != nil {
+					logf("launch connect failed: %v", cerr)
+					showError("NeConnect Bridge", fmt.Sprintf("接続できませんでした:\n%v", cerr))
 					globalUI.setStatus("待機中 — 接続に失敗しました")
 					return
 				}
+				persist(serverURLs, targetIdx, appPath, route)
 				port = own.socksPort()
 			}
 
@@ -1566,6 +1557,23 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 				return
 			}
 			globalUI.setStatus("ショートカットを作成しました")
+		}()
+	}
+
+	hooks.onClearCache = func() {
+		go func() {
+			cfgMu.Lock()
+			had := cfg.Route != nil
+			cfg.Route = nil
+			saved := cfg
+			cfgMu.Unlock()
+			if !had {
+				globalUI.setStatus("前回の接続は保存されていません")
+				return
+			}
+			saveConfig(dir, saved)
+			logf("connection cache cleared")
+			globalUI.setStatus("接続キャッシュをクリアしました")
 		}()
 	}
 
@@ -1669,9 +1677,9 @@ func generateURLImpl(dir string, cfg Config, signer ssh.Signer, currentURLs stri
 			errs = append(errs, "bridge("+raw+"): "+uerr.Error())
 			continue
 		}
-		pollURL = strings.TrimSuffix(httpURL, "/server") + "/poll"
+		pollURL = pollURLFor(httpURL)
 		logf("Connecting to bridge (%s) to generate URL...", raw)
-		eng, cerr := newBridgeEngine("secure", httpURL, pollURL, signer)
+		eng, cerr := newBridgeEngine(httpURL, pollURL, signer)
 		if cerr != nil {
 			errs = append(errs, "bridge("+raw+"): "+cerr.Error())
 			continue
@@ -1721,7 +1729,7 @@ func generateURLImpl(dir string, cfg Config, signer ssh.Signer, currentURLs stri
 
 	if generated == "" {
 		globalUI.setStatus("待機中 — リクエストに失敗しました")
-		showError("NeConnect Bridge", fmt.Sprintf("ブリッジURLの取得に失敗しました:\n%s\n\n詳細はログを確認してください。", strings.Join(errs, "\n")))
+		showError("NeConnect Bridge", fmt.Sprintf("ブリッジURLの取得に失敗しました:\n%s", strings.Join(errs, "\n")))
 		return
 	}
 	globalUI.appendGeneratedURL(generated)

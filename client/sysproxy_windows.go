@@ -135,11 +135,13 @@ func setSystemSOCKSProxy(addr string) (*sysProxyBackup, error) {
 	if err := k.SetDWordValue("ProxyEnable", 1); err != nil {
 		return nil, err
 	}
-	if err := k.SetStringValue("ProxyServer", "socks="+addr); err != nil {
+	// 普通の HTTP プロキシとして知らせる。
+	// socks= は古い SOCKS4 として扱うソフトがあり、つながらない原因になる。
+	if err := k.SetStringValue("ProxyServer", addr); err != nil {
 		return nil, err
 	}
 	refreshWinINET()
-	logf("System SOCKS proxy enabled: socks=%s", addr)
+	logf("System proxy enabled: %s", addr)
 	return bk, nil
 }
 
