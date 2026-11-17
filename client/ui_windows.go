@@ -38,27 +38,40 @@ var (
 	procGetStockObject   = gdi32.NewProc("GetStockObject")
 	procCreateFontW      = gdi32.NewProc("CreateFontW")
 	procSetFocus         = user32.NewProc("SetFocus")
+	procSetForeground    = user32.NewProc("SetForegroundWindow")
+	procGetCursorPos     = user32.NewProc("GetCursorPos")
+	procCreatePopupMenu  = user32.NewProc("CreatePopupMenu")
+	procAppendMenuW      = user32.NewProc("AppendMenuW")
+	procTrackPopupMenu   = user32.NewProc("TrackPopupMenu")
+	procDestroyMenu      = user32.NewProc("DestroyMenu")
+	procLoadIconW        = user32.NewProc("LoadIconW")
+	procRegisterMsgW     = user32.NewProc("RegisterWindowMessageW")
+	procSetWindowLongPtr = user32.NewProc("SetWindowLongPtrW")
+	procCallWindowProcW  = user32.NewProc("CallWindowProcW")
+	procGetKeyState      = user32.NewProc("GetKeyState")
+	procGetScrollInfo    = user32.NewProc("GetScrollInfo")
+	procShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
 )
 
 const (
-	wsOverlapped  = 0x00000000
-	wsCaption     = 0x00C00000
-	wsSysMenu     = 0x00080000
-	wsMinimizeBox = 0x00020000
-	wsVisible     = 0x10000000
-	wsChild       = 0x40000000
-	wsTabStop     = 0x00010000
-	wsBorder      = 0x00800000
-	wsVScroll     = 0x00200000
-	wsHScroll     = 0x00100000
-	wsClipSibling = 0x04000000
-	esMultiline   = 0x0004
-	esAutoVScroll = 0x0040
-	esAutoHScroll = 0x0080
-	esReadOnly    = 0x0800
-	esWantReturn  = 0x1000
-	bsPushBtn     = 0x0000
-	bsDefPushBtn  = 0x0001
+	wsOverlapped   = 0x00000000
+	wsCaption      = 0x00C00000
+	wsSysMenu      = 0x00080000
+	wsMinimizeBox  = 0x00020000
+	wsVisible      = 0x10000000
+	wsChild        = 0x40000000
+	wsTabStop      = 0x00010000
+	wsBorder       = 0x00800000
+	wsVScroll      = 0x00200000
+	wsHScroll      = 0x00100000
+	wsClipSibling  = 0x04000000
+	esMultiline    = 0x0004
+	esAutoVScroll  = 0x0040
+	esAutoHScroll  = 0x0080
+	esReadOnly     = 0x0800
+	esWantReturn   = 0x1000
+	bsPushBtn      = 0x0000
+	bsDefPushBtn   = 0x0001
 	cbsDropDownLst = 0x0003
 	cbsHasStrings  = 0x0200
 	wsExClientEdge = 0x00000200
@@ -89,7 +102,6 @@ const (
 
 	idServerEdit    = 105
 	idGenBtn        = 106
-	idModeCombo     = 107
 	idStatusLbl     = 108
 	idConnectBtn    = 109
 	idDisconnectBtn = 110
@@ -99,14 +111,60 @@ const (
 	idLaunchBtn     = 114
 	idShortcutBtn   = 115
 	idLogBtn        = 116
+	idCacheBtn      = 117
 
-	wmAppStatus  = wmApp + 1
-	wmAppState   = wmApp + 2
+	wmAppStatus    = wmApp + 1
+	wmAppState     = wmApp + 2
 	wmAppAppendURL = wmApp + 3
-	wmAppError   = wmApp + 4
-	wmAppWake    = wmApp + 5
-	wmAppQuit    = wmApp + 6
-	wmAppShowLog = wmApp + 7
+	wmAppError     = wmApp + 4
+	wmAppWake      = wmApp + 5
+	wmAppQuit      = wmApp + 6
+	wmAppShowLog   = wmApp + 7
+	wmAppTray      = wmApp + 8
+	wmAppMinimize  = wmApp + 9
+	wmAppRestore   = wmApp + 10
+
+	// ログ欄の選択とスクロールを扱うための値
+	emGetSel       = 0x00B0
+	emLineIndex    = 0x00BB
+	emScrollCaret  = 0x00B7
+	emGetScrollPos = 0x045D
+	emSetScrollPos = 0x045E
+
+	// 通知領域
+	wmSysCommand    = 0x0112
+	scMinimize      = 0xF020
+	scRestore       = 0xF120
+	wmKeyDown       = 0x0100
+	wmKeyUp         = 0x0101
+	wmChar          = 0x0102
+	wmSysKeyDown    = 0x0104
+	wmContextMenu   = 0x007B
+	wmLeftButtonUp  = 0x0202
+	wmLeftDblClk    = 0x0203
+	wmRightButtonUp = 0x0205
+	wmNull          = 0x0000
+	wmGetMinMaxInfo = 0x0024
+	tpmRightButton  = 0x0002
+	tpmReturnCmd    = 0x0100
+	tpmNoNotify     = 0x0080
+	mfString        = 0x0000
+	mfSeparator     = 0x0800
+	cmdTrayOpen     = 0xE001
+	cmdTrayExit     = 0xE002
+	nimAdd          = 0
+	nimModify       = 1
+	nimDelete       = 2
+	nifMessage      = 0x00000001
+	nifIcon         = 0x00000002
+	nifTip          = 0x00000004
+	idiApplication  = 32512
+	swRestore       = 9
+	swShowNormal    = 1
+	gwlpWndProc     = ^uintptr(3) // -4
+	vkA             = 0x41
+	vkControl       = 0x11
+	sbVert          = 1
 )
 
 type wndClassExW struct {
@@ -135,10 +193,11 @@ type msgStruct struct {
 }
 
 type uiHooks struct {
-	onConnect        func(serverURLs string, modeIdx int)
+	onConnect        func(serverURLs string)
 	onDisconnect     func()
-	onLaunch         func(targetIdx int, appPath, serverURLs string, modeIdx int)
+	onLaunch         func(targetIdx int, appPath, serverURLs string)
 	onCreateShortcut func(targetIdx int, appPath string)
+	onClearCache     func()
 	onOpenLog        func()
 }
 
@@ -157,11 +216,12 @@ type mainUI struct {
 	pendingLogs  []string
 	pendingPaths []string
 	logLines     []string
+	logShown     int
+	wakePending  bool
 
 	hwnd          uintptr
 	serverEdit    uintptr
 	genBtn        uintptr
-	modeCombo     uintptr
 	statusLbl     uintptr
 	connectBtn    uintptr
 	disconnectBtn uintptr
@@ -171,9 +231,15 @@ type mainUI struct {
 	launchBtn     uintptr
 	shortcutBtn   uintptr
 	logBtn        uintptr
+	cacheBtn      uintptr
 
 	logHwnd uintptr
 	logEdit uintptr
+	logProc uintptr
+
+	trayAdded  bool
+	trayWanted bool
+	trayID     uint32
 
 	connected  bool
 	connecting bool
@@ -181,6 +247,41 @@ type mainUI struct {
 
 	hooks uiHooks
 }
+
+type notifyIconDataW struct {
+	cbSize           uint32
+	hWnd             uintptr
+	uID              uint32
+	uFlags           uint32
+	uCallbackMessage uint32
+	hIcon            uintptr
+	szTip            [128]uint16
+	dwState          uint32
+	dwStateMask      uint32
+	szInfo           [256]uint16
+	uTimeoutOrVer    uint32
+	szInfoTitle      [64]uint16
+	dwInfoFlags      uint32
+	guidItem         [16]byte
+	hBalloonIcon     uintptr
+}
+
+type pointStruct struct {
+	x int32
+	y int32
+}
+
+type scrollInfo struct {
+	cbSize    uint32
+	fMask     uint32
+	nMin      int32
+	nMax      int32
+	nPage     uint32
+	nPos      int32
+	nTrackPos int32
+}
+
+const sifAll = 0x00000017
 
 func u16(s string) *uint16 {
 	p, _ := syscall.UTF16PtrFromString(s)
@@ -220,6 +321,24 @@ func (u *mainUI) wake() {
 	if u.hwnd != 0 {
 		procPostMessageW.Call(u.hwnd, wmAppWake, 0, 0)
 	}
+}
+
+// wakeLater は、続けて起きた変化をまとめて1回だけ画面に伝える。
+func (u *mainUI) wakeLater() {
+	u.mu.Lock()
+	if u.wakePending {
+		u.mu.Unlock()
+		return
+	}
+	u.wakePending = true
+	u.mu.Unlock()
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		u.mu.Lock()
+		u.wakePending = false
+		u.mu.Unlock()
+		u.wake()
+	}()
 }
 
 func (u *mainUI) windowHandle() uintptr {
@@ -338,7 +457,7 @@ func uiAppendLog(line string) {
 		ui.pendingLogs = append(ui.pendingLogs, line)
 	}
 	ui.mu.Unlock()
-	ui.wake()
+	ui.wakeLater()
 }
 
 func mkLabel(parent uintptr, text string, px, py, pw, ph int, hFont uintptr, hInst uintptr) uintptr {
@@ -393,25 +512,96 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 		ui.logLines = append(ui.logLines, lines[start:]...)
 	}
 
+	logAtBottom := func() bool {
+		if ui.logEdit == 0 {
+			return true
+		}
+		var si scrollInfo
+		si.cbSize = uint32(unsafe.Sizeof(si))
+		si.fMask = sifAll
+		r, _, _ := procGetScrollInfo.Call(ui.logEdit, sbVert, uintptr(unsafe.Pointer(&si)))
+		if r == 0 {
+			return true
+		}
+		return int(si.nPos)+int(si.nPage) >= int(si.nMax)-2
+	}
+
+	saveScroll := func() (pointStruct, bool) {
+		var pt pointStruct
+		if ui.logEdit == 0 {
+			return pt, false
+		}
+		r, _, _ := procSendMessageW.Call(ui.logEdit, emGetScrollPos, 0, uintptr(unsafe.Pointer(&pt)))
+		return pt, r != 0
+	}
+
+	// syncLog は、覚えている行とログ欄の中身を合わせる。
+	syncLog := func(force bool) {
+		if ui.logEdit == 0 {
+			return
+		}
+		total := len(ui.logLines)
+		if !force && ui.logShown == total {
+			return
+		}
+		if force || ui.logShown < 0 || ui.logShown > total {
+			setText(ui.logEdit, strings.Join(ui.logLines, "\r\n"))
+			ui.logShown = total
+			procSendMessageW.Call(ui.logEdit, emSetSel, ^uintptr(0), ^uintptr(0))
+			procSendMessageW.Call(ui.logEdit, wmVScroll, sbBottom, 0)
+			return
+		}
+		lines := ui.logLines[ui.logShown:]
+		if len(lines) == 0 {
+			return
+		}
+
+		atBottom := logAtBottom()
+		pos, hadPos := saveScroll()
+
+		// 選んでいる範囲があれば、追記のあとに戻す。
+		var selStart, selEnd uint32
+		procSendMessageW.Call(ui.logEdit, emGetSel,
+			uintptr(unsafe.Pointer(&selStart)), uintptr(unsafe.Pointer(&selEnd)))
+
+		procSendMessageW.Call(ui.logEdit, emSetSel, ^uintptr(0), ^uintptr(0))
+		chunk := strings.Join(lines, "\r\n") + "\r\n"
+		procSendMessageW.Call(ui.logEdit, emReplaceSel, 0, uintptr(unsafe.Pointer(u16(chunk))))
+		ui.logShown = total
+
+		if selEnd > selStart {
+			procSendMessageW.Call(ui.logEdit, emSetSel, uintptr(selStart), uintptr(selEnd))
+		}
+		if atBottom {
+			procSendMessageW.Call(ui.logEdit, wmVScroll, sbBottom, 0)
+		} else if hadPos {
+			procSendMessageW.Call(ui.logEdit, emSetScrollPos, 0, uintptr(unsafe.Pointer(&pos)))
+		}
+	}
+
 	appendLogLines := func(lines []string) {
 		if len(lines) == 0 {
 			return
 		}
 		ui.logLines = append(ui.logLines, lines...)
+		dropped := 0
 		if len(ui.logLines) > 2000 {
-			ui.logLines = append([]string{}, ui.logLines[len(ui.logLines)-1200:]...)
-			if ui.logEdit != 0 {
-				setText(ui.logEdit, strings.Join(ui.logLines, "\r\n"))
-				procSendMessageW.Call(ui.logEdit, wmVScroll, sbBottom, 0)
-			}
+			dropped = len(ui.logLines) - 1200
+			ui.logLines = append([]string{}, ui.logLines[dropped:]...)
+		}
+		if ui.logEdit == 0 {
 			return
 		}
-		if ui.logEdit != 0 && isWindowVisible(ui.logHwnd) {
-			chunk := strings.Join(lines, "\r\n") + "\r\n"
-			procSendMessageW.Call(ui.logEdit, emSetSel, ^uintptr(0), ^uintptr(0))
-			procSendMessageW.Call(ui.logEdit, emReplaceSel, 0, uintptr(unsafe.Pointer(u16(chunk))))
-			procSendMessageW.Call(ui.logEdit, wmVScroll, sbBottom, 0)
+		if !isWindowVisible(ui.logHwnd) {
+			// 閉じている間は触らず、開いたときにまとめて追いつかせる。
+			ui.logShown = -1
+			return
 		}
+		if dropped > 0 {
+			syncLog(true)
+			return
+		}
+		syncLog(false)
 	}
 
 	logProc := syscall.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
@@ -440,6 +630,28 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 	}
 	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wcLog)))
 
+	// ログ欄の中で Ctrl+A を効かせるための受け渡し。
+	editProc := syscall.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+		switch msg {
+		case wmChar:
+			if wParam == 1 {
+				procSendMessageW.Call(hwnd, emSetSel, 0, ^uintptr(0))
+				return 0
+			}
+		case wmKeyDown, wmSysKeyDown:
+			if wParam == vkA {
+				state, _, _ := procGetKeyState.Call(vkControl)
+				if int16(state) < 0 {
+					procSendMessageW.Call(hwnd, emSetSel, 0, ^uintptr(0))
+					return 0
+				}
+			}
+		}
+		ret, _, _ := procCallWindowProcW.Call(ui.logProc, hwnd, uintptr(msg), wParam, lParam)
+		return ret
+	})
+	taskbarCreatedMsg, _, _ := procRegisterMsgW.Call(uintptr(unsafe.Pointer(u16("TaskbarCreated"))))
+
 	syncTarget := func() {
 		sel, _, _ := procSendMessageW.Call(ui.targetCombo, cbGetCurSel, 0, 0)
 		isApp := int(sel) == targetApp
@@ -453,8 +665,76 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 		procEnableWindow.Call(ui.disconnectBtn, boolFlag(busy))
 		procEnableWindow.Call(ui.serverEdit, boolFlag(!busy))
 		procEnableWindow.Call(ui.genBtn, boolFlag(!busy))
-		procEnableWindow.Call(ui.modeCombo, boolFlag(!busy))
 		syncTarget()
+	}
+
+	// ---- 通知領域 --------------------------------------------------
+
+	addTray := func() {
+		if ui.hwnd == 0 {
+			return
+		}
+		ui.trayWanted = true
+		if ui.trayAdded {
+			return
+		}
+		var nid notifyIconDataW
+		nid.cbSize = uint32(unsafe.Sizeof(nid))
+		nid.hWnd = ui.hwnd
+		nid.uID = 1
+		nid.uFlags = nifMessage | nifIcon | nifTip
+		nid.uCallbackMessage = wmAppTray
+		nid.hIcon, _, _ = procLoadIconW.Call(0, idiApplication)
+		tip, _ := syscall.UTF16FromString("NeConnect Bridge")
+		copy(nid.szTip[:], tip)
+		r, _, _ := procShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
+		if r != 0 {
+			ui.trayAdded = true
+		}
+	}
+
+	removeTray := func() {
+		ui.trayWanted = false
+		if !ui.trayAdded || ui.hwnd == 0 {
+			return
+		}
+		var nid notifyIconDataW
+		nid.cbSize = uint32(unsafe.Sizeof(nid))
+		nid.hWnd = ui.hwnd
+		nid.uID = 1
+		procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
+		ui.trayAdded = false
+	}
+
+	restoreFromTray := func() {
+		removeTray()
+		procShowWindow.Call(ui.hwnd, swShowNormal)
+		procShowWindow.Call(ui.hwnd, swRestore)
+		procSetForeground.Call(ui.hwnd)
+	}
+
+	trayMenu := func() {
+		menu, _, _ := procCreatePopupMenu.Call()
+		if menu == 0 {
+			return
+		}
+		procAppendMenuW.Call(menu, mfString, cmdTrayOpen, uintptr(unsafe.Pointer(u16("開く"))))
+		procAppendMenuW.Call(menu, mfSeparator, 0, 0)
+		procAppendMenuW.Call(menu, mfString, cmdTrayExit, uintptr(unsafe.Pointer(u16("終了"))))
+		var pt pointStruct
+		procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+		procSetForeground.Call(ui.hwnd)
+		cmd, _, _ := procTrackPopupMenu.Call(menu,
+			tpmRightButton|tpmReturnCmd|tpmNoNotify,
+			uintptr(uint32(pt.x)), uintptr(uint32(pt.y)), 0, ui.hwnd, 0)
+		procDestroyMenu.Call(menu)
+		procPostMessageW.Call(ui.hwnd, wmNull, 0, 0)
+		switch cmd {
+		case cmdTrayOpen:
+			restoreFromTray()
+		case cmdTrayExit:
+			procPostMessageW.Call(ui.hwnd, wmClose, 0, 0)
+		}
 	}
 
 	applyRunState := func(state int) {
@@ -504,18 +784,43 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 				uintptr(unsafe.Pointer(u16("Consolas"))),
 			)
 			procSendMessageW.Call(ui.logEdit, wmSetFont, fixedFont, 1)
-			if len(ui.logLines) > 0 {
-				setText(ui.logEdit, strings.Join(ui.logLines, "\r\n"))
-			}
+			ui.logProc, _, _ = procSetWindowLongPtr.Call(ui.logEdit, gwlpWndProc, editProc)
+			ui.logShown = -1
 			procSendMessageW.Call(ui.logHwnd, wmSize, 0, uintptr(uint32(w)<<16|uint32(h)))
 		}
 		procShowWindow.Call(ui.logHwnd, swShow)
 		procUpdateWindow.Call(ui.logHwnd)
+		syncLog(ui.logShown < 0)
 		procSetFocus.Call(ui.logEdit)
 	}
 
 	wndProc := syscall.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+		if taskbarCreatedMsg != 0 && msg == uint32(taskbarCreatedMsg) {
+			if ui.trayWanted {
+				ui.trayAdded = false
+				addTray()
+			}
+			return 0
+		}
 		switch msg {
+		case wmAppMinimize:
+			addTray()
+			if ui.logHwnd != 0 {
+				procShowWindow.Call(ui.logHwnd, swHide)
+			}
+			procShowWindow.Call(hwnd, swHide)
+			return 0
+		case wmAppRestore:
+			restoreFromTray()
+			return 0
+		case wmAppTray:
+			switch uint32(lParam) & 0xffff {
+			case wmLeftButtonUp, wmLeftDblClk:
+				restoreFromTray()
+			case wmRightButtonUp, wmContextMenu:
+				trayMenu()
+			}
+			return 0
 		case wmAppWake, wmAppStatus, wmAppState, wmAppAppendURL, wmAppError:
 			if text, ok := ui.takeStatus(); ok {
 				setText(ui.statusLbl, text)
@@ -587,8 +892,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 			case idConnectBtn:
 				if !ui.connecting && !ui.connected && ui.hooks.onConnect != nil {
 					urls := getText(ui.serverEdit)
-					mIdx, _, _ := procSendMessageW.Call(ui.modeCombo, cbGetCurSel, 0, 0)
-					go ui.hooks.onConnect(urls, int(mIdx))
+					go ui.hooks.onConnect(urls)
 				}
 				return 0
 			case idDisconnectBtn:
@@ -601,8 +905,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 					tIdx, _, _ := procSendMessageW.Call(ui.targetCombo, cbGetCurSel, 0, 0)
 					path := getText(ui.appPathEdit)
 					urls := getText(ui.serverEdit)
-					mIdx, _, _ := procSendMessageW.Call(ui.modeCombo, cbGetCurSel, 0, 0)
-					go ui.hooks.onLaunch(int(tIdx), path, urls, int(mIdx))
+					go ui.hooks.onLaunch(int(tIdx), path, urls)
 				}
 				return 0
 			case idShortcutBtn:
@@ -627,13 +930,29 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 					ui.hooks.onOpenLog()
 				}
 				return 0
+			case idCacheBtn:
+				if !ui.connecting && !ui.connected && ui.hooks.onClearCache != nil {
+					go ui.hooks.onClearCache()
+				}
+				return 0
 			}
 			return 0
+		case wmSysCommand:
+			if wParam&0xFFF0 == scMinimize {
+				procPostMessageW.Call(hwnd, wmAppMinimize, 0, 0)
+				return 0
+			}
+		case wmSize:
+			if wParam&0xffff == 1 {
+				procPostMessageW.Call(hwnd, wmAppMinimize, 0, 0)
+				return 0
+			}
 		case wmClose:
 			if ui.closing {
 				return 0
 			}
 			ui.closing = true
+			removeTray()
 			go func() {
 				done := make(chan struct{})
 				go func() {
@@ -654,6 +973,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 			procDestroyWindow.Call(hwnd)
 			return 0
 		case wmDestroy:
+			removeTray()
 			procPostQuitMessage.Call(0)
 			return 0
 		}
@@ -672,7 +992,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 
 	sw, _, _ := procGetSystemMetrics.Call(0)
 	sh, _, _ := procGetSystemMetrics.Call(1)
-	w, h := uintptr(470), uintptr(400)
+	w, h := uintptr(470), uintptr(380)
 	x := (sw - w) / 2
 	y := (sh - h) / 2
 
@@ -689,7 +1009,6 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 
 	mkLabel(ui.hwnd, "ブリッジURL", 20, 10, 200, 16, hFont, hInst)
 	ui.genBtn = mkButton(ui.hwnd, "ブリッジURLをリクエスト", 285, 6, 150, 26, idGenBtn, hFont, hInst)
-
 	editText := strings.ReplaceAll(cfg.ServerURL, "\n", "\r\n")
 	editText = strings.ReplaceAll(editText, "\r\r\n", "\r\n")
 	ui.serverEdit, _, _ = procCreateWindowExW.Call(
@@ -702,26 +1021,15 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 	)
 	procSendMessageW.Call(ui.serverEdit, wmSetFont, hFont, 1)
 
-	mkLabel(ui.hwnd, "接続方法", 20, 128, 100, 16, hFont, hInst)
-	ui.modeCombo, _, _ = procCreateWindowExW.Call(
-		0, uintptr(unsafe.Pointer(u16("COMBOBOX"))), 0,
-		wsChild|wsVisible|wsTabStop|cbsDropDownLst|cbsHasStrings,
-		20, 146, 190, 160, ui.hwnd, idModeCombo, hInst, 0,
-	)
-	procSendMessageW.Call(ui.modeCombo, wmSetFont, hFont, 1)
-	for _, label := range []string{"オート", "スピード", "バランス", "セキュア"} {
-		procSendMessageW.Call(ui.modeCombo, cbAddString, 0, uintptr(unsafe.Pointer(u16(label))))
-	}
-	procSendMessageW.Call(ui.modeCombo, cbSetCurSel, uintptr(cfg.ModeIdx), 0)
+	ui.connectBtn = mkButton(ui.hwnd, "Connect", 20, 128, 95, 28, idConnectBtn, hFont, hInst)
+	ui.disconnectBtn = mkButton(ui.hwnd, "Disconnect", 123, 128, 105, 28, idDisconnectBtn, hFont, hInst)
+	ui.cacheBtn = mkButton(ui.hwnd, "接続キャッシュをクリア", 236, 128, 199, 28, idCacheBtn, hFont, hInst)
 
-	ui.connectBtn = mkButton(ui.hwnd, "Connect", 225, 146, 95, 26, idConnectBtn, hFont, hInst)
-	ui.disconnectBtn = mkButton(ui.hwnd, "Disconnect", 330, 146, 105, 26, idDisconnectBtn, hFont, hInst)
-
-	mkLabel(ui.hwnd, "起動対象", 20, 190, 100, 16, hFont, hInst)
+	mkLabel(ui.hwnd, "起動対象", 20, 168, 100, 16, hFont, hInst)
 	ui.targetCombo, _, _ = procCreateWindowExW.Call(
 		0, uintptr(unsafe.Pointer(u16("COMBOBOX"))), 0,
 		wsChild|wsVisible|wsTabStop|cbsDropDownLst|cbsHasStrings,
-		20, 208, 190, 200, ui.hwnd, idTargetCombo, hInst, 0,
+		20, 186, 190, 200, ui.hwnd, idTargetCombo, hInst, 0,
 	)
 	procSendMessageW.Call(ui.targetCombo, wmSetFont, hFont, 1)
 	for _, label := range targetLabels {
@@ -734,17 +1042,17 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 		uintptr(unsafe.Pointer(u16("EDIT"))),
 		uintptr(unsafe.Pointer(u16(cfg.AppPath))),
 		wsChild|wsVisible|wsTabStop|wsBorder|esAutoHScroll,
-		225, 208, 155, 25,
+		225, 186, 155, 25,
 		ui.hwnd, idAppPath, hInst, 0,
 	)
 	procSendMessageW.Call(ui.appPathEdit, wmSetFont, hFont, 1)
-	ui.browseBtn = mkButton(ui.hwnd, "参照", 385, 208, 50, 25, idBrowseBtn, hFont, hInst)
+	ui.browseBtn = mkButton(ui.hwnd, "参照", 385, 186, 50, 25, idBrowseBtn, hFont, hInst)
 
-	ui.launchBtn = mkButton(ui.hwnd, "Launch", 20, 245, 120, 32, idLaunchBtn, hFont, hInst)
-	ui.shortcutBtn = mkButton(ui.hwnd, "ショートカットを作成", 150, 245, 190, 32, idShortcutBtn, hFont, hInst)
-	ui.logBtn = mkButton(ui.hwnd, "ログ", 350, 245, 85, 32, idLogBtn, hFont, hInst)
+	ui.launchBtn = mkButton(ui.hwnd, "Launch", 20, 223, 120, 32, idLaunchBtn, hFont, hInst)
+	ui.shortcutBtn = mkButton(ui.hwnd, "ショートカットを作成", 150, 223, 190, 32, idShortcutBtn, hFont, hInst)
+	ui.logBtn = mkButton(ui.hwnd, "ログ", 350, 223, 85, 32, idLogBtn, hFont, hInst)
 
-	ui.statusLbl = mkLabel(ui.hwnd, "待機中", 20, 290, 415, 60, hFont, hInst)
+	ui.statusLbl = mkLabel(ui.hwnd, "待機中", 20, 266, 415, 60, hFont, hInst)
 
 	procDragAcceptFiles.Call(ui.hwnd, 1)
 
