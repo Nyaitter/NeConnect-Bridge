@@ -61,7 +61,9 @@ func (s *session) connect(serverURLs string, cached *routeCache, withSystemProxy
 	var route *routeCache
 	var allErrs []string
 
-	// 前回の経路を先に試す。
+	// 前回の経路を先に試す。表示は通常の接続と同じまま、順番だけ先に置く。
+	total := len(urlList)
+	pos := 1
 	if cached != nil {
 		raw := strings.TrimSpace(cached.URL)
 		switch {
@@ -70,7 +72,9 @@ func (s *session) connect(serverURLs string, cached *routeCache, withSystemProxy
 		case !containsURL(urlList, raw):
 			logf("cached route skipped: %s is not in the list", raw)
 		default:
-			setStatus("前回の接続先で接続中...")
+			total++
+			setStatus(fmt.Sprintf("接続中... [%d/%d]", pos, total))
+			pos++
 			e, cerr := s.dialRoute(*cached, raw)
 			if cerr != nil {
 				logf("cached route failed: %v", cerr)
@@ -85,13 +89,14 @@ func (s *session) connect(serverURLs string, cached *routeCache, withSystemProxy
 	}
 
 	if eng == nil {
-		for idx, rawURL := range urlList {
+		for _, rawURL := range urlList {
 			_, httpURL, uerr := toWSURL(rawURL, "auto")
 			if uerr != nil {
 				allErrs = append(allErrs, rawURL+": "+uerr.Error())
 				continue
 			}
-			setStatus(fmt.Sprintf("接続中... [%d/%d]", idx+1, len(urlList)))
+			setStatus(fmt.Sprintf("接続中... [%d/%d]", pos, total))
+			pos++
 			e, cerr := newBridgeEngine(httpURL, pollURLFor(httpURL), s.signer)
 			if cerr == nil {
 				eng = e

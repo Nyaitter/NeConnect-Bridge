@@ -3,6 +3,8 @@ package main
 import (
 	"os"
 	"path/filepath"
+
+	"neconnectbridge/internal/logqueue"
 	"runtime"
 	"strings"
 	"sync"
@@ -93,6 +95,7 @@ const (
 	cbGetCurSel    = 0x0147
 	cbnSelChange   = 1
 	emSetSel       = 0x00B1
+	emSetLimitText = 0x00C5
 	emReplaceSel   = 0x00C2
 	emSetReadOnly  = 0x00CF
 	emGetLineCount = 0x00BA
@@ -242,7 +245,7 @@ type mainUI struct {
 	runState     int
 	pendingURLs  []string
 	pendingErrs  []uiMessage
-	pendingLogs  []string
+	logs         *logqueue.Queue
 	pendingPaths []string
 	logLines     []string
 	logShown     int
@@ -312,9 +315,26 @@ type scrollInfo struct {
 
 const sifAll = 0x00000017
 
+// u16 は、文字列を Windows の文字列に直す。
+// 途中に入れられない文字が混ざっていても、落とさずに置き換えて渡す。
 func u16(s string) *uint16 {
-	p, _ := syscall.UTF16PtrFromString(s)
-	return p
+	if p, err := syscall.UTF16PtrFromString(s); err == nil {
+		return p
+	}
+	buf := make([]uint16, 0, len(s)+1)
+	for _, r := range s {
+		if r == 0 {
+			r = ' '
+		}
+		buf = append(buf, uint16(r))
+		if r > 0xFFFF {
+			// 面の外の文字は、そのままでは入れられないので置き換える。
+			buf = buf[:len(buf)-1]
+			buf = append(buf, 0xFFFD)
+		}
+	}
+	buf = append(buf, 0)
+	return &buf[0]
 }
 
 func getText(hwnd uintptr) string {
@@ -347,9 +367,16 @@ func showError(title, text string) {
 }
 
 func (u *mainUI) wake() {
-	if u.hwnd != 0 {
-		procPostMessageW.Call(u.hwnd, wmAppWake, 0, 0)
+	if h := u.windowHandle(); h != 0 {
+		procPostMessageW.Call(h, wmAppWake, 0, 0)
 	}
+}
+
+// setWindowHandle は、窓を作ったときに控える。
+func (u *mainUI) setWindowHandle(h uintptr) {
+	u.mu.Lock()
+	u.hwnd = h
+	u.mu.Unlock()
 }
 
 // wakeLater は、続けて起きた変化をまとめて1回だけ画面に伝える。
@@ -361,13 +388,13 @@ func (u *mainUI) wakeLater() {
 	}
 	u.wakePending = true
 	u.mu.Unlock()
-	go func() {
+	goSafe("ui wake", func() {
 		time.Sleep(150 * time.Millisecond)
 		u.mu.Lock()
 		u.wakePending = false
 		u.mu.Unlock()
 		u.wake()
-	}()
+	})
 }
 
 func (u *mainUI) windowHandle() uintptr {
@@ -466,13 +493,12 @@ func (u *mainUI) takeErrors() []uiMessage {
 
 func (u *mainUI) takeLogs() []string {
 	u.mu.Lock()
-	defer u.mu.Unlock()
-	if len(u.pendingLogs) == 0 {
+	q := u.logs
+	u.mu.Unlock()
+	if q == nil {
 		return nil
 	}
-	logs := u.pendingLogs
-	u.pendingLogs = nil
-	return logs
+	return q.Take()
 }
 
 // uiAppendLog はログをファイルと画面の両方へ流す。
@@ -482,10 +508,12 @@ func uiAppendLog(line string) {
 		return
 	}
 	ui.mu.Lock()
-	if len(ui.pendingLogs) < 4000 {
-		ui.pendingLogs = append(ui.pendingLogs, line)
-	}
+	q := ui.logs
 	ui.mu.Unlock()
+	if q == nil {
+		return
+	}
+	q.Push(line)
 	ui.wakeLater()
 }
 
@@ -517,7 +545,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 	className := u16("NeConnectBridgeWnd")
 	logClass := u16("NeConnectBridgeLogWnd")
 
-	ui := &mainUI{runState: -1, hooks: hooks}
+	ui := &mainUI{runState: -1, hooks: hooks, logs: logqueue.New(4000)}
 	globalUI = ui
 
 	loadLogTail := func(limit int) {
@@ -586,6 +614,10 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 			return
 		}
 		total := len(ui.logLines)
+		if !force && ui.logShown >= 0 && total-ui.logShown > 400 {
+			// まとめて増えたときは、書き足すより今の内容で作り直すほうが軽い。
+			force = true
+		}
 		if !force && ui.logShown == total {
 			return
 		}
@@ -675,7 +707,14 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 		moveWindow(ui.logEdit, margin, margin, w-margin*2, h-margin*2)
 	}
 
-	logProc := syscall.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+	logProc := syscall.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) (result uintptr) {
+		defer func() {
+			if r := recover(); r != nil {
+				logf("log window stopped: %v", r)
+				writeCrashReport("log window", r)
+				result = 0
+			}
+		}()
 		switch msg {
 		case wmClose:
 			procShowWindow.Call(hwnd, swHide)
@@ -713,7 +752,14 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wcLog)))
 
 	// ログ欄の中で Ctrl+A を効かせるための受け渡し。
-	editProc := syscall.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+	editProc := syscall.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) (result uintptr) {
+		defer func() {
+			if r := recover(); r != nil {
+				logf("log view stopped: %v", r)
+				writeCrashReport("log view", r)
+				result = 0
+			}
+		}()
 		switch msg {
 		case wmChar:
 			if wParam == 1 {
@@ -866,6 +912,8 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 				uintptr(unsafe.Pointer(u16("Consolas"))),
 			)
 			procSendMessageW.Call(ui.logEdit, wmSetFont, fixedFont, 1)
+			// 既定の文字数上限に達すると末尾で切れるため、余裕を持たせる。
+			procSendMessageW.Call(ui.logEdit, emSetLimitText, 0x7FFFFFFE, 0)
 			ui.logProc, _, _ = procSetWindowLongPtr.Call(ui.logEdit, gwlpWndProc, editProc)
 			ui.logShown = -1
 			layoutLogWindow()
@@ -876,7 +924,14 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 		procSetFocus.Call(ui.logEdit)
 	}
 
-	wndProc := syscall.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+	wndProc := syscall.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) (result uintptr) {
+		defer func() {
+			if r := recover(); r != nil {
+				logf("window stopped: %v", r)
+				writeCrashReport("window", r)
+				result = 0
+			}
+		}()
 		if taskbarCreatedMsg != 0 && msg == uint32(taskbarCreatedMsg) {
 			if ui.trayWanted {
 				ui.trayAdded = false
@@ -968,18 +1023,18 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 			case idGenBtn:
 				if !ui.connecting && !ui.connected {
 					cur := getText(ui.serverEdit)
-					go generateURL(cur)
+					goSafe("url request", func() { generateURL(cur) })
 				}
 				return 0
 			case idConnectBtn:
 				if !ui.connecting && !ui.connected && ui.hooks.onConnect != nil {
 					urls := getText(ui.serverEdit)
-					go ui.hooks.onConnect(urls)
+					goSafe("connect", func() { ui.hooks.onConnect(urls) })
 				}
 				return 0
 			case idDisconnectBtn:
 				if ui.hooks.onDisconnect != nil {
-					go ui.hooks.onDisconnect()
+					goSafe("disconnect", func() { ui.hooks.onDisconnect() })
 				}
 				return 0
 			case idLaunchBtn:
@@ -987,25 +1042,25 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 					tIdx, _, _ := procSendMessageW.Call(ui.targetCombo, cbGetCurSel, 0, 0)
 					path := getText(ui.appPathEdit)
 					urls := getText(ui.serverEdit)
-					go ui.hooks.onLaunch(int(tIdx), path, urls)
+					goSafe("launch", func() { ui.hooks.onLaunch(int(tIdx), path, urls) })
 				}
 				return 0
 			case idShortcutBtn:
 				if ui.hooks.onCreateShortcut != nil {
 					tIdx, _, _ := procSendMessageW.Call(ui.targetCombo, cbGetCurSel, 0, 0)
 					path := getText(ui.appPathEdit)
-					go ui.hooks.onCreateShortcut(int(tIdx), path)
+					goSafe("shortcut", func() { ui.hooks.onCreateShortcut(int(tIdx), path) })
 				}
 				return 0
 			case idBrowseBtn:
 				// ファイル選択は簡易にエクスプローラ風ダイアログを使う
-				go func() {
+				goSafe("pick file", func() {
 					picked, ok := pickAppFile(ui.windowHandle())
 					if ok && picked != "" {
 						procSendMessageW.Call(ui.targetCombo, cbSetCurSel, targetApp, 0)
 						ui.postPickedPath(picked)
 					}
-				}()
+				})
 				return 0
 			case idLogBtn:
 				if ui.hooks.onOpenLog != nil {
@@ -1014,7 +1069,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 				return 0
 			case idCacheBtn:
 				if !ui.connecting && !ui.connected && ui.hooks.onClearCache != nil {
-					go ui.hooks.onClearCache()
+					goSafe("clear cache", func() { ui.hooks.onClearCache() })
 				}
 				return 0
 			}
@@ -1102,6 +1157,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 		ui.hwnd, idServerEdit, hInst, 0,
 	)
 	procSendMessageW.Call(ui.serverEdit, wmSetFont, hFont, 1)
+	procSendMessageW.Call(ui.serverEdit, emSetLimitText, 1<<20, 0)
 
 	ui.connectBtn = mkButton(ui.hwnd, "Connect", 20, 128, 95, 28, idConnectBtn, hFont, hInst)
 	ui.disconnectBtn = mkButton(ui.hwnd, "Disconnect", 123, 128, 105, 28, idDisconnectBtn, hFont, hInst)
