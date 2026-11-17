@@ -469,23 +469,18 @@ async function handleH2(req, res) {
   }
 
   if (op === 'up' && req.method === 'POST') {
-    // 送られてくる分をそのまま奥へ流し、受け取り終わるまで返事を待たせる。
-    res.writeHead(200, {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store, no-transform',
-      'x-accel-buffering': 'no',
-    });
-    res.flushHeaders();
+    // 送られてくる分をそのまま奥へ流す。
+    // 返事は受け取り終わってからにする。先に返すと、間に立つ中継に断られることがある。
     let received = 0;
     req.on('data', (chunk) => {
       received += chunk.length;
       pipe.fromClient(chunk);
     });
     req.on('end', () => {
-      if (!res.writableEnded) res.end(JSON.stringify({ ok: true, received }));
+      json(res, 200, { ok: true, received });
     });
     req.on('aborted', () => {
-      if (!res.writableEnded) res.end();
+      if (!res.headersSent) res.writeHead(499).end();
     });
     return;
   }
