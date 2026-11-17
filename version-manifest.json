@@ -15,7 +15,7 @@
     "client/internal/obfs/obfs.go": "78f7f3db92134eed51b0d54188bd0106c1b5d976612ee56441fb53999ee45d88",
     "client/internal/wsconn/wsconn.go": "4c2509fe4c47d89eba69e840e4df89589afc764ac0b043bb41fde607c3ca811f",
     "client/launcher_windows.go": "4229c04fcb4b9275ecd8cfd21bf5eaa9d1d05210818dc373fe408876187831ed",
-    "client/main.go": "9a8ed58cb5d0dd7d3d6286b1a9ed8492e9b09bc51b591f1c0849a3b1185befc9",
+    "client/main.go": "3939e4be31937eba05df973a817bda6d552bbb70671c148ff564a0ffbb354a34",
     "client/proxy.go": "0e33e43d2730155b5e31e40b9a40380503d2faac591b6f2715392b0e501f11ba",
     "client/session_windows.go": "9a30547cf825ce3b9729ced264d7b62cad94d1c05058dd3a13165722a10b3480",
     "client/shortcut_windows.go": "f0323c4d9b6046b00e9b6501ee3567a9ce7737eac2a0c9b97e94bc5570f5ca38",
