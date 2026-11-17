@@ -57,7 +57,9 @@ const (
 	wsOverlapped   = 0x00000000
 	wsCaption      = 0x00C00000
 	wsSysMenu      = 0x00080000
+	wsThickFrame   = 0x00040000
 	wsMinimizeBox  = 0x00020000
+	wsMaximizeBox  = 0x00010000
 	wsVisible      = 0x10000000
 	wsChild        = 0x40000000
 	wsTabStop      = 0x00010000
@@ -76,6 +78,7 @@ const (
 	cbsHasStrings  = 0x0200
 	wsExClientEdge = 0x00000200
 	wmDestroy      = 0x0002
+	wmCreate       = 0x0001
 	wmSize         = 0x0005
 	wmClose        = 0x0010
 	wmSetFont      = 0x0030
@@ -166,6 +169,27 @@ const (
 	vkControl       = 0x11
 	sbVert          = 1
 )
+
+type rect struct {
+	left   int32
+	top    int32
+	right  int32
+	bottom int32
+}
+
+type point struct {
+	x int32
+	y int32
+}
+
+// minMaxInfo は、窓の大きさの上限と下限を渡すための形。
+type minMaxInfo struct {
+	reserved       point
+	maxSize        point
+	maxPosition    point
+	minTrackSize   point
+	maxTrackSize   point
+}
 
 type wndClassExW struct {
 	cbSize        uint32
@@ -604,16 +628,41 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 		syncLog(false)
 	}
 
+	// ログ欄は、窓の大きさが変わるたびに中身の広さへ合わせ直す。
+	layoutLogWindow := func() {
+		if ui.logHwnd == 0 || ui.logEdit == 0 {
+			return
+		}
+		rc := rect{}
+		ok, _, _ := procGetClientRect.Call(ui.logHwnd, uintptr(unsafe.Pointer(&rc)))
+		if ok == 0 {
+			return
+		}
+		w := int(rc.right - rc.left)
+		h := int(rc.bottom - rc.top)
+		if w <= 0 || h <= 0 {
+			return
+		}
+		const margin = 8
+		moveWindow(ui.logEdit, margin, margin, w-margin*2, h-margin*2)
+	}
+
 	logProc := syscall.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		switch msg {
 		case wmClose:
 			procShowWindow.Call(hwnd, swHide)
 			return 0
+		case wmCreate:
+			layoutLogWindow()
+			return 0
 		case wmSize:
-			if ui.logEdit != 0 {
-				w := int(lParam & 0xffff)
-				h := int((lParam >> 16) & 0xffff)
-				moveWindow(ui.logEdit, 4, 4, w-8, h-8)
+			layoutLogWindow()
+			return 0
+		case wmGetMinMaxInfo:
+			if lParam != 0 {
+				mm := (*minMaxInfo)(unsafe.Pointer(lParam))
+				mm.minTrackSize.x = 360
+				mm.minTrackSize.y = 240
 			}
 			return 0
 		}
@@ -763,7 +812,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 				0,
 				uintptr(unsafe.Pointer(logClass)),
 				uintptr(unsafe.Pointer(u16("ログ"))),
-				wsOverlapped|wsCaption|wsSysMenu|wsMinimizeBox|wsVisible,
+				wsOverlapped|wsCaption|wsSysMenu|wsThickFrame|wsMinimizeBox|wsMaximizeBox|wsVisible,
 				x, y, w, h,
 				0, 0, hInst, 0,
 			)
@@ -774,8 +823,8 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 				wsExClientEdge,
 				uintptr(unsafe.Pointer(u16("EDIT"))),
 				0,
-				wsChild|wsVisible|wsTabStop|wsBorder|wsVScroll|wsHScroll|esMultiline|esReadOnly|esAutoVScroll|esAutoHScroll,
-				4, 4, w-16, h-40,
+				wsChild|wsVisible|wsTabStop|wsBorder|wsVScroll|esMultiline|esReadOnly|esAutoVScroll,
+				0, 0, 0, 0,
 				ui.logHwnd, 0, hInst, 0,
 			)
 			fixedFont, _, _ := procCreateFontW.Call(
@@ -786,7 +835,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 			procSendMessageW.Call(ui.logEdit, wmSetFont, fixedFont, 1)
 			ui.logProc, _, _ = procSetWindowLongPtr.Call(ui.logEdit, gwlpWndProc, editProc)
 			ui.logShown = -1
-			procSendMessageW.Call(ui.logHwnd, wmSize, 0, uintptr(uint32(w)<<16|uint32(h)))
+			layoutLogWindow()
 		}
 		procShowWindow.Call(ui.logHwnd, swShow)
 		procUpdateWindow.Call(ui.logHwnd)
@@ -1096,6 +1145,7 @@ func moveWindow(h uintptr, x, y, w, hgt int) {
 }
 
 var procMoveWindow = user32.NewProc("MoveWindow")
+var procGetClientRect = user32.NewProc("GetClientRect")
 
 // postPickedPath は参照ボタンで選ばれたパスを画面へ反映する。
 func (u *mainUI) postPickedPath(path string) {
