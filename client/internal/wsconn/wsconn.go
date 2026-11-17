@@ -1,6 +1,7 @@
 package wsconn
 
 import (
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -27,7 +28,9 @@ func (c *Conn) Read(p []byte) (int, error) {
 		if c.reader == nil {
 			mt, r, err := c.ws.NextReader()
 			if err != nil {
-				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				// 相手が閉じたときは、流れの終わりとして扱う。
+				var closeErr *websocket.CloseError
+				if errors.As(err, &closeErr) {
 					return 0, io.EOF
 				}
 				return 0, err

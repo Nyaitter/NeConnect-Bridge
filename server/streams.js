@@ -141,7 +141,7 @@ class WsDuplex extends Duplex {
 
   _final(callback) {
     try {
-      this.ws.close();
+      this.ws.close(1000);
     } catch {
       // closing an already closed socket needs no handling
     }

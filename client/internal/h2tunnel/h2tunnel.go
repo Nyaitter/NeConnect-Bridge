@@ -1,6 +1,7 @@
 package h2tunnel
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,11 +14,11 @@ import (
 	"neconnectbridge/internal/endpoint"
 )
 
-// rotateAfter は、1本のアップロードを張り直す間隔。
-// 受け口が待ち続けないよう、待ち時間の上限より短くしておく。
-const rotateAfter = 60 * time.Second
+// maxBatch は、1回の送信にまとめる量の上限。
+const maxBatch = 128 * 1024
 
-var errUpDone = errors.New("upload stream closed")
+// uploadWait は、1回の送信にかける待ち時間の上限。
+const uploadWait = 30 * time.Second
 
 type Conn struct {
 	base   string
@@ -34,8 +35,8 @@ type Conn struct {
 	closer sync.Once
 }
 
-// Dial は、HTTP/2 の流れを二本使う中継を開く。
-// 上りは一続きの送信、下りは一続きの受信で、同じ接続の上に並べる。
+// Dial は、下りは一続きの受信、上りはその横に並べた送信で中継を開く。
+// どちらも同じ HTTP/2 の接続の上に置く。
 func Dial(baseURL string, client *http.Client) (net.Conn, error) {
 	if client == nil {
 		return nil, errors.New("http client is required")
@@ -110,71 +111,53 @@ func (c *Conn) startDown() error {
 	return nil
 }
 
-// upLoop は、途切れたら次のアップロードを張り直す。
+// upLoop は、送る分をまとめてから順に届ける。
 func (c *Conn) upLoop() {
 	for {
+		var batch []byte
 		select {
 		case <-c.done:
 			return
-		default:
+		case first := <-c.writes:
+			batch = first
 		}
-		if err := c.upSession(); err != nil {
-			if errors.Is(err, errUpDone) {
-				return
+		// 続けて届いている分は、同じ送信にまとめる。
+	collect:
+		for len(batch) < maxBatch {
+			select {
+			case more := <-c.writes:
+				batch = append(batch, more...)
+			default:
+				break collect
 			}
-			c.shutdown(err)
+		}
+		if err := c.upload(batch); err != nil {
+			// 送り始めを断られたときは、この形を受け付けない相手とみなす。
+			c.shutdown(fmt.Errorf("%w (%v)", endpoint.ErrUnavailable, err))
 			return
 		}
 	}
 }
 
-// upSession は、上りを一本張って、切り替えの時まで送る。
-func (c *Conn) upSession() error {
-	pr, pw := io.Pipe()
-	ctx, cancel := context.WithCancel(context.Background())
+func (c *Conn) upload(body []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), uploadWait)
 	defer cancel()
-	req, err := endpoint.Request(ctx, "POST", c.base, c.sid, "up", pr)
+	req, err := endpoint.Request(ctx, "POST", c.base, c.sid, "up", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = -1
-
-	finished := make(chan error, 1)
-	go func() {
-		resp, derr := c.client.Do(req)
-		if derr != nil {
-			finished <- derr
-			return
-		}
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		_ = resp.Body.Close()
-		finished <- nil
-	}()
-
-	timer := time.NewTimer(rotateAfter)
-	defer timer.Stop()
-	for {
-		select {
-		case <-c.done:
-			_ = pw.Close()
-			<-finished
-			return errUpDone
-		case <-timer.C:
-			_ = pw.Close()
-			<-finished
-			return nil
-		case err := <-finished:
-			_ = pw.Close()
-			return err
-		case chunk := <-c.writes:
-			if _, werr := pw.Write(chunk); werr != nil {
-				_ = pw.CloseWithError(werr)
-				<-finished
-				return werr
-			}
-		}
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
 	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("upload failed: %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (c *Conn) Read(p []byte) (int, error) {
