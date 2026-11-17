@@ -432,6 +432,161 @@ function json(res, status, body) {
   res.end(payload);
 }
 
+// STREAM_TRANSPORTS は、このサーバーが受けられる中継の形。
+const STREAM_TRANSPORTS = ['ws', 'h2', 'range', 'poll', 'sse', 'asset'];
+
+function endMissing(res) {
+  json(res, 410, { ok: false, error: 'session gone' });
+}
+
+// handleH2 は、一続きの送信と受信を組み合わせて中継する。
+async function handleH2(req, res) {
+  const url = new URL(req.url, 'http://localhost');
+  const sid = (url.searchParams.get('sid') || '').trim();
+  const op = (url.searchParams.get('op') || '').trim();
+  if (!sid) {
+    res.writeHead(400).end('missing sid');
+    return;
+  }
+  if (op === 'open' && req.method === 'POST') {
+    openTunnel(sid, `h2:${sid}`);
+    log(`[h2:${sid}] open`);
+    json(res, 200, { ok: true, transport: 'h2' });
+    return;
+  }
+
+  const pipe = tunnelSessions.get(sid);
+  if (!pipe) {
+    endMissing(res);
+    return;
+  }
+
+  if (op === 'close') {
+    pipe.close();
+    if (tunnelSessions.get(sid) === pipe) tunnelSessions.delete(sid);
+    json(res, 200, { ok: true });
+    return;
+  }
+
+  if (op === 'up' && req.method === 'POST') {
+    // 送られてくる分をそのまま奥へ流し、受け取り終わるまで返事を待たせる。
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store, no-transform',
+      'x-accel-buffering': 'no',
+    });
+    res.flushHeaders();
+    let received = 0;
+    req.on('data', (chunk) => {
+      received += chunk.length;
+      pipe.fromClient(chunk);
+    });
+    req.on('end', () => {
+      if (!res.writableEnded) res.end(JSON.stringify({ ok: true, received }));
+    });
+    req.on('aborted', () => {
+      if (!res.writableEnded) res.end();
+    });
+    return;
+  }
+
+  if (op === 'down' && req.method === 'GET') {
+    res.writeHead(200, {
+      'content-type': 'application/octet-stream',
+      'cache-control': 'no-store, no-transform',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no',
+    });
+    res.flushHeaders();
+    let active = true;
+    req.on('close', () => {
+      active = false;
+      pipe.close();
+      if (tunnelSessions.get(sid) === pipe) tunnelSessions.delete(sid);
+    });
+    while (active && !res.writableEnded) {
+      const chunk = await pipe.next(20000);
+      if (chunk === null) break;
+      if (chunk === undefined) continue;
+      res.write(chunk);
+    }
+    if (!res.writableEnded) res.end();
+    return;
+  }
+
+  res.writeHead(405).end('method not allowed');
+}
+
+// handleRange は、続きを取りに行く形で中継する。
+async function handleRange(req, res) {
+  const url = new URL(req.url, 'http://localhost');
+  const sid = (url.searchParams.get('sid') || '').trim();
+  const op = (url.searchParams.get('op') || '').trim();
+  const offset = Number(url.searchParams.get('offset') || '0') || 0;
+  if (!sid) {
+    res.writeHead(400).end('missing sid');
+    return;
+  }
+  if (op === 'open' && req.method === 'POST') {
+    openTunnel(sid, `range:${sid}`);
+    log(`[range:${sid}] open`);
+    json(res, 200, { ok: true, transport: 'range' });
+    return;
+  }
+
+  const pipe = tunnelSessions.get(sid);
+  if (!pipe) {
+    endMissing(res);
+    return;
+  }
+
+  if (op === 'close') {
+    pipe.close();
+    if (tunnelSessions.get(sid) === pipe) tunnelSessions.delete(sid);
+    json(res, 200, { ok: true });
+    return;
+  }
+
+  if (req.method === 'POST') {
+    const body = await readBody(req, 4 * 1024 * 1024);
+    if (body.length > 0) pipe.fromClient(body);
+    res.writeHead(206, {
+      'content-type': 'application/json; charset=utf-8',
+      'accept-ranges': 'bytes',
+      'content-range': `bytes ${offset}-${offset + Math.max(body.length, 1) - 1}/*`,
+      'cache-control': 'no-store, no-transform',
+    });
+    res.end(JSON.stringify({ ok: true, received: body.length, offset }));
+    return;
+  }
+
+  if (req.method === 'GET') {
+    const first = await pipe.next(20000);
+    if (first === null) {
+      endMissing(res);
+      return;
+    }
+    const parts = [];
+    if (first !== undefined) parts.push(first);
+    while (pipe.chunks.length > 0) parts.push(pipe.chunks.shift());
+    if (parts.length === 0) {
+      res.writeHead(204, { 'accept-ranges': 'bytes', 'cache-control': 'no-store' }).end();
+      return;
+    }
+    const body = Buffer.concat(parts);
+    res.writeHead(206, {
+      'content-type': 'application/octet-stream',
+      'accept-ranges': 'bytes',
+      'content-range': `bytes ${offset}-${offset + body.length - 1}/*`,
+      'cache-control': 'no-store, no-transform',
+    });
+    res.end(body);
+    return;
+  }
+
+  res.writeHead(405).end('method not allowed');
+}
+
 function html(res, body) {
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(body);
@@ -497,6 +652,7 @@ const server = http.createServer(async (req, res) => {
         service: 'NeConnect Bridge Server',
         status: 'ok',
         modes: ['secure', 'balance', 'speed'],
+        transports: STREAM_TRANSPORTS,
       };
       const challenge = (url.searchParams.get('challenge') || '').trim();
       if (challenge) payload.proof = challengeProof(challenge);
@@ -751,6 +907,16 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (pathname === '/bridge/h2') {
+      await handleH2(req, res);
+      return;
+    }
+
+    if (pathname === '/bridge/range') {
+      await handleRange(req, res);
+      return;
+    }
+
     if (pathname === '/bridge/poll') {
       await handlePoll(req, res);
       return;
@@ -758,6 +924,17 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/bridge/dashboard') {
       html(res, dashboardHTML);
+      return;
+    }
+
+    if (pathname === '/bridge' || pathname === '/') {
+      html(res, homeHTML);
+      return;
+    }
+
+    // 知らない受け口は、はっきり断って次の手段へ移れるようにする。
+    if (pathname.startsWith('/bridge/')) {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('not found');
       return;
     }
 
