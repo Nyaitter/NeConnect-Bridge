@@ -80,6 +80,9 @@ const (
 	wmDestroy      = 0x0002
 	wmCreate       = 0x0001
 	wmSize         = 0x0005
+	wmSetRedraw    = 0x000B
+	wmGetTextLen   = 0x000E
+	wmMouseWheel   = 0x020A
 	wmClose        = 0x0010
 	wmSetFont      = 0x0030
 	wmCommand      = 0x0111
@@ -133,6 +136,8 @@ const (
 	emScrollCaret  = 0x00B7
 	emGetScrollPos = 0x045D
 	emSetScrollPos = 0x045E
+	emLineScroll   = 0x00C9
+	emFirstVisible = 0x00CE
 
 	// 通知領域
 	wmSysCommand    = 0x0112
@@ -536,31 +541,47 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 		ui.logLines = append(ui.logLines, lines[start:]...)
 	}
 
-	logAtBottom := func() bool {
+	// firstVisibleLine は、いま一番上に見えている行を返す。
+	firstVisibleLine := func() int {
 		if ui.logEdit == 0 {
-			return true
+			return 0
+		}
+		r, _, _ := procSendMessageW.Call(ui.logEdit, emFirstVisible, 0, 0)
+		return int(uint16(r))
+	}
+
+	// logFollowState は、末尾を見ているかどうかと、先頭の表示行を返す。
+	logFollowState := func() (bool, int) {
+		if ui.logEdit == 0 {
+			return true, 0
 		}
 		var si scrollInfo
 		si.cbSize = uint32(unsafe.Sizeof(si))
 		si.fMask = sifAll
 		r, _, _ := procGetScrollInfo.Call(ui.logEdit, sbVert, uintptr(unsafe.Pointer(&si)))
 		if r == 0 {
-			return true
+			return true, firstVisibleLine()
 		}
-		return int(si.nPos)+int(si.nPage) >= int(si.nMax)-2
+		atBottom := int(si.nPos)+int(si.nPage) >= int(si.nMax)-1
+		return atBottom, firstVisibleLine()
 	}
 
-	saveScroll := func() (pointStruct, bool) {
-		var pt pointStruct
-		if ui.logEdit == 0 {
-			return pt, false
+	scrollToBottom := func() {
+		if ui.logEdit != 0 {
+			procSendMessageW.Call(ui.logEdit, wmVScroll, sbBottom, 0)
 		}
-		r, _, _ := procSendMessageW.Call(ui.logEdit, emGetScrollPos, 0, uintptr(unsafe.Pointer(&pt)))
-		return pt, r != 0
 	}
 
-	// syncLog は、覚えている行とログ欄の中身を合わせる。
-	syncLog := func(force bool) {
+	scrollLines := func(delta int) {
+		if ui.logEdit == 0 || delta == 0 {
+			return
+		}
+		procSendMessageW.Call(ui.logEdit, emLineScroll, 0, uintptr(uint32(int32(delta))))
+	}
+
+	// syncLog は、増えた行だけを末尾へ書き足す。
+	// 読んでいる位置は、書き足す前の行に合わせて戻す。
+	syncLog := func(force bool, trimmed int) {
 		if ui.logEdit == 0 {
 			return
 		}
@@ -568,39 +589,46 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 		if !force && ui.logShown == total {
 			return
 		}
+		atBottom, firstLine := logFollowState()
+		procSendMessageW.Call(ui.logEdit, wmSetRedraw, 0, 0)
 		if force || ui.logShown < 0 || ui.logShown > total {
 			setText(ui.logEdit, strings.Join(ui.logLines, "\r\n"))
 			ui.logShown = total
-			procSendMessageW.Call(ui.logEdit, emSetSel, ^uintptr(0), ^uintptr(0))
-			procSendMessageW.Call(ui.logEdit, wmVScroll, sbBottom, 0)
-			return
+			if atBottom {
+				scrollToBottom()
+			} else {
+				// 先頭が削られた分だけ手前へずらして、同じ場所を見せる。
+				keep := firstLine - trimmed
+				if keep < 0 {
+					keep = 0
+				}
+				scrollLines(keep)
+			}
+		} else {
+			lines := ui.logLines[ui.logShown:]
+			if len(lines) == 0 {
+				procSendMessageW.Call(ui.logEdit, wmSetRedraw, 1, 0)
+				return
+			}
+			// 書き足す前に、必ずいまの末尾へ位置を移す。
+			endLen, _, _ := procSendMessageW.Call(ui.logEdit, wmGetTextLen, 0, 0)
+			end := int(endLen)
+			procSendMessageW.Call(ui.logEdit, emSetSel, uintptr(end), uintptr(end))
+			chunk := strings.Join(lines, "\r\n")
+			if end > 0 {
+				chunk = "\r\n" + chunk
+			}
+			procSendMessageW.Call(ui.logEdit, emReplaceSel, 0, uintptr(unsafe.Pointer(u16(chunk))))
+			ui.logShown = total
+			if atBottom {
+				scrollToBottom()
+			} else {
+				// 末尾へ動いた表示を、書き足す前の行まで戻す。
+				scrollLines(firstLine - firstVisibleLine())
+			}
 		}
-		lines := ui.logLines[ui.logShown:]
-		if len(lines) == 0 {
-			return
-		}
-
-		atBottom := logAtBottom()
-		pos, hadPos := saveScroll()
-
-		// 選んでいる範囲があれば、追記のあとに戻す。
-		var selStart, selEnd uint32
-		procSendMessageW.Call(ui.logEdit, emGetSel,
-			uintptr(unsafe.Pointer(&selStart)), uintptr(unsafe.Pointer(&selEnd)))
-
-		procSendMessageW.Call(ui.logEdit, emSetSel, ^uintptr(0), ^uintptr(0))
-		chunk := strings.Join(lines, "\r\n") + "\r\n"
-		procSendMessageW.Call(ui.logEdit, emReplaceSel, 0, uintptr(unsafe.Pointer(u16(chunk))))
-		ui.logShown = total
-
-		if selEnd > selStart {
-			procSendMessageW.Call(ui.logEdit, emSetSel, uintptr(selStart), uintptr(selEnd))
-		}
-		if atBottom {
-			procSendMessageW.Call(ui.logEdit, wmVScroll, sbBottom, 0)
-		} else if hadPos {
-			procSendMessageW.Call(ui.logEdit, emSetScrollPos, 0, uintptr(unsafe.Pointer(&pos)))
-		}
+		procSendMessageW.Call(ui.logEdit, wmSetRedraw, 1, 0)
+		procInvalidateRect.Call(ui.logEdit, 0, 1)
 	}
 
 	appendLogLines := func(lines []string) {
@@ -622,10 +650,10 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 			return
 		}
 		if dropped > 0 {
-			syncLog(true)
+			syncLog(true, dropped)
 			return
 		}
-		syncLog(false)
+		syncLog(false, 0)
 	}
 
 	// ログ欄は、窓の大きさが変わるたびに中身の広さへ合わせ直す。
@@ -657,6 +685,11 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 			return 0
 		case wmSize:
 			layoutLogWindow()
+			return 0
+		case wmMouseWheel:
+			if ui.logEdit != 0 {
+				procSendMessageW.Call(ui.logEdit, wmMouseWheel, wParam, lParam)
+			}
 			return 0
 		case wmGetMinMaxInfo:
 			if lParam != 0 {
@@ -839,7 +872,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 		}
 		procShowWindow.Call(ui.logHwnd, swShow)
 		procUpdateWindow.Call(ui.logHwnd)
-		syncLog(ui.logShown < 0)
+		syncLog(ui.logShown < 0, 0)
 		procSetFocus.Call(ui.logEdit)
 	}
 
@@ -1146,6 +1179,7 @@ func moveWindow(h uintptr, x, y, w, hgt int) {
 
 var procMoveWindow = user32.NewProc("MoveWindow")
 var procGetClientRect = user32.NewProc("GetClientRect")
+var procInvalidateRect = user32.NewProc("InvalidateRect")
 
 // postPickedPath は参照ボタンで選ばれたパスを画面へ反映する。
 func (u *mainUI) postPickedPath(path string) {

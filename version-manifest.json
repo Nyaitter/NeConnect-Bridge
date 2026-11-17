@@ -24,7 +24,7 @@
     "client/session_windows.go": "a0b838e78a6088c5c19616891d1eb49c6352f20af170182c3cf5c7265f715582",
     "client/shortcut_windows.go": "f0323c4d9b6046b00e9b6501ee3567a9ce7737eac2a0c9b97e94bc5570f5ca38",
     "client/sysproxy_windows.go": "5c0de81ffcce06eb1a5623fa8d3eaa4dc80e9c932127ba3dd514e81192857de0",
-    "client/ui_windows.go": "86bf4933818a477f9f82be1b0ec746e32aebfaef5729a924f3051567269d69dc",
+    "client/ui_windows.go": "49b8f1720c47c6d8ca9ffac04744338d1b8772b6ce01cd4d868a539c46174a61",
     "hook/nctb_hook.c": "91782ef21adfc26b368ddefdafa9a49e3ea0625dead05be109f1c05cf187e556",
     "package-lock.json": "6e583423346b162c512efcc6b8b05c8c79e6ab326f396413887fd5e4971fe25c",
     "package.json": "93684428ef3f535481a9cc7c45a43646b17ea3e8fb487beefc8e5adda222a7fb",
