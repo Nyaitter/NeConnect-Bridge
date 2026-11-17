@@ -317,27 +317,40 @@ func Cleanup(exePath string) {
 	}
 }
 
+// Plan は、新しい版があるかを確かめ、あればその版を返す。
+// 取り寄せはしないので、呼び出し側は時間のかけどころを別に決められる。
+func Plan(ctx context.Context, client *http.Client, base, currentVersion string, logf func(string, ...any)) (Release, bool, error) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	m, err := Fetch(ctx, client, base)
+	if err != nil {
+		return Release{}, false, err
+	}
+	rel, ok := m.Newest()
+	if !ok {
+		logf("更新チェック: 配られている版がありません")
+		return Release{}, false, nil
+	}
+	if !IsNewer(rel.Version, currentVersion) {
+		logf("更新チェック: 最新は %s です（いま %s）", rel.Version, currentVersion)
+		return Release{}, false, nil
+	}
+	if strings.TrimSpace(rel.SHA256) == "" {
+		return Release{}, false, ErrNoDigest
+	}
+	return rel, true, nil
+}
+
 // Stage は、新しい版があれば取り寄せて差し替える。
 // 失敗しても、いま動いている実行ファイルはそのまま残る。
 func Stage(ctx context.Context, client *http.Client, base, currentVersion, exePath string, logf func(string, ...any)) (Result, error) {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	m, err := Fetch(ctx, client, base)
-	if err != nil {
+	rel, newer, err := Plan(ctx, client, base, currentVersion, logf)
+	if err != nil || !newer {
 		return Result{}, err
-	}
-	rel, ok := m.Newest()
-	if !ok {
-		logf("更新チェック: 配られている版がありません")
-		return Result{}, nil
-	}
-	if !IsNewer(rel.Version, currentVersion) {
-		logf("更新チェック: 最新は %s です（いま %s）", rel.Version, currentVersion)
-		return Result{}, nil
-	}
-	if strings.TrimSpace(rel.SHA256) == "" {
-		return Result{}, ErrNoDigest
 	}
 	logf("更新 %s を取得します（いま %s）", rel.Version, currentVersion)
 	newPath := exePath + ".new"

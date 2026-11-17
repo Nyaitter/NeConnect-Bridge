@@ -55,21 +55,38 @@ func runUpdateCheck(port int, serverURLs string, apply func()) {
 
 	// 確認も取り寄せも、いま張った入口（SOCKS5）を通す。
 	// 直結では弾かれる回線があるため、ここだけは必ず中継の上を通す。
-	hc := socksHTTPClient(port, updateCheckTimeout)
-	ctx, cancel := context.WithTimeout(context.Background(), updateDownloadTimeout)
-	defer cancel()
+	hc := socksHTTPClient(port, updateDownloadTimeout)
 
-	res, err := selfupdate.Stage(ctx, hc, base, appVersion, exe, logf)
+	// 一覧の確認は短く切り上げる。つながっている接続を長く待たせない。
+	checkCtx, cancel := context.WithTimeout(context.Background(), updateCheckTimeout)
+	rel, newer, err := selfupdate.Plan(checkCtx, hc, base, appVersion, logf)
+	cancel()
 	if err != nil {
 		// 更新の確認に失敗しても、接続そのものは壊さない。
 		logf("更新を確かめられませんでした: %v", err)
 		return
 	}
-	if !res.Updated {
+	if !newer {
 		return
 	}
-	logf("更新 (v%s) を取得しました", res.Version)
-	if !askRestart("新しいバージョン (v" + res.Version + ") を取得しました。今すぐ再起動して適用しますか？") {
+
+	dlCtx, cancelDl := context.WithTimeout(context.Background(), updateDownloadTimeout)
+	defer cancelDl()
+	logf("更新 %s を取得します（いま %s）", rel.Version, appVersion)
+	newPath := exe + ".new"
+	_ = os.Remove(newPath)
+	if err := selfupdate.Download(dlCtx, hc, base, rel, newPath); err != nil {
+		_ = os.Remove(newPath)
+		logf("更新を取得できませんでした: %v", err)
+		return
+	}
+	if err := selfupdate.Apply(exe, newPath); err != nil {
+		_ = os.Remove(newPath)
+		logf("更新を適用できませんでした: %v", err)
+		return
+	}
+	logf("更新 (v%s) を取得しました", rel.Version)
+	if !askRestart("新しいバージョン (v" + rel.Version + ") を取得しました。今すぐ再起動して適用しますか？") {
 		logf("次に起動したときから新しい版を使います")
 		return
 	}
