@@ -647,14 +647,14 @@ func (e *bridgeEngine) warmPool() error {
 	e.pool = make(chan net.Conn, poolSize)
 	e.pool <- first
 	e.noteRoute("wsPool:" + stage.label())
-	_ = e.fillPool()
+	_ = e.fillPool(poolSize)
 	logf("wsPool connected with %d streams via %s", len(e.pool), stage.label())
 	go e.refillLoop()
 	return nil
 }
 
 // fillPool は、足りない流れを並べて張る。
-func (e *bridgeEngine) fillPool() error {
+func (e *bridgeEngine) fillPool(parallel int) error {
 	missing := poolSize - len(e.pool)
 	if missing <= 0 || e.pool == nil {
 		return nil
@@ -663,7 +663,7 @@ func (e *bridgeEngine) fillPool() error {
 	var mu sync.Mutex
 	var firstErr error
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, poolRefillMax)
+	sem := make(chan struct{}, parallel)
 	for i := 0; i < missing; i++ {
 		wg.Add(1)
 		go func() {
@@ -1062,7 +1062,7 @@ func (e *bridgeEngine) refillLoop() {
 			if e.pool == nil || len(e.pool) >= poolLowWater {
 				continue
 			}
-			if err := e.fillPool(); err != nil {
+			if err := e.fillPool(poolRefillMax); err != nil {
 				failures++
 				backoff := time.Duration(failures) * 500 * time.Millisecond
 				if backoff > 8*time.Second {
