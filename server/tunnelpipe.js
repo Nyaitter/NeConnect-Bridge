@@ -44,6 +44,7 @@ class TunnelPipe {
   next(timeoutMs) {
     if (this.chunks.length > 0) return Promise.resolve(this.chunks.shift());
     if (this.closed) return Promise.resolve(null);
+    if (timeoutMs <= 0) return Promise.resolve(undefined);
     return new Promise((resolve) => {
       const deliver = (chunk) => {
         clearTimeout(timer);

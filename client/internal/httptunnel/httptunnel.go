@@ -26,7 +26,7 @@ type ClientConn struct {
 	closeMu sync.Mutex
 }
 
-func Dial(baseURL string, client *http.Client) (*ClientConn, error) {
+func Dial(ctx context.Context, baseURL string, client *http.Client) (*ClientConn, error) {
 	var b [12]byte
 	_, _ = rand.Read(b[:])
 	sid := hex.EncodeToString(b[:])
@@ -34,7 +34,7 @@ func Dial(baseURL string, client *http.Client) (*ClientConn, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 35 * time.Second}
 	}
-	req, err := http.NewRequest("POST", baseURL+"?sid="+sid+"&op=open", nil)
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"?sid="+sid+"&op=open", nil)
 	if err != nil {
 		return nil, err
 	}

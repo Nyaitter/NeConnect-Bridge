@@ -2,6 +2,7 @@ package covert
 
 import (
 	"bufio"
+	"context"
 	"bytes"
 	"crypto/rand"
 	"encoding/base64"
@@ -158,9 +159,11 @@ type sseConn struct {
 	closeOnce sync.Once
 	cancel    chan struct{}
 	writeMu   sync.Mutex
+	stop      func()
+	body      io.Closer
 }
 
-func DialSSE(origin string, client *http.Client) (net.Conn, error) {
+func DialSSE(ctx context.Context, origin string, client *http.Client) (net.Conn, error) {
 	sid := newSessionID()
 	conn := &sseConn{
 		streamURL: origin + "/bridge/stream?sid=" + sid,
@@ -169,20 +172,32 @@ func DialSSE(origin string, client *http.Client) (net.Conn, error) {
 		chunks:    make(chan []byte, 64),
 		cancel:    make(chan struct{}),
 	}
-	req, err := http.NewRequest("GET", conn.streamURL, nil)
+	// 開くまでは待ち時間に上限を置き、開いた後はこの流れだけで閉じる。
+	streamCtx, streamStop := context.WithCancel(context.WithoutCancel(ctx))
+	conn.stop = streamStop
+	req, err := http.NewRequestWithContext(streamCtx, "GET", conn.streamURL, nil)
 	if err != nil {
+		streamStop()
 		return nil, err
 	}
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("User-Agent", userAgent)
+	openTimer := time.AfterFunc(12*time.Second, streamStop)
 	resp, err := client.Do(req)
+	if !openTimer.Stop() && err == nil {
+		streamStop()
+		err = errors.New("stream open timed out")
+	}
 	if err != nil {
+		streamStop()
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
+		streamStop()
 		return nil, fmt.Errorf("stream unavailable: %d", resp.StatusCode)
 	}
+	conn.body = resp.Body
 	go conn.readLoop(resp)
 	return conn, nil
 }
@@ -256,7 +271,15 @@ func (c *sseConn) Write(p []byte) (int, error) {
 }
 
 func (c *sseConn) Close() error {
-	c.closeOnce.Do(func() { close(c.cancel) })
+	c.closeOnce.Do(func() {
+		close(c.cancel)
+		if c.stop != nil {
+			c.stop()
+		}
+		if c.body != nil {
+			_ = c.body.Close()
+		}
+	})
 	return nil
 }
 
@@ -272,6 +295,7 @@ type assetConn struct {
 	client    *http.Client
 	mu        sync.Mutex
 	pending   []byte
+	idleWait  time.Duration
 	closeOnce sync.Once
 	closed    bool
 	writeMu   sync.Mutex
@@ -279,12 +303,12 @@ type assetConn struct {
 
 const assetChunk = 1200
 
-func DialAsset(origin string, client *http.Client) (net.Conn, error) {
+func DialAsset(ctx context.Context, origin string, client *http.Client) (net.Conn, error) {
 	conn := &assetConn{
 		assetURL: origin + "/bridge/assets/logo.png?sid=" + newSessionID(),
 		client:   client,
 	}
-	data, err := conn.fetch(nil)
+	data, err := conn.fetch(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -292,8 +316,8 @@ func DialAsset(origin string, client *http.Client) (net.Conn, error) {
 	return conn, nil
 }
 
-func (c *assetConn) fetch(payload []byte) ([]byte, error) {
-	req, err := http.NewRequest("GET", c.assetURL, nil)
+func (c *assetConn) fetch(ctx context.Context, payload []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.assetURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -329,14 +353,23 @@ func (c *assetConn) Read(p []byte) (int, error) {
 			return n, nil
 		}
 		c.mu.Unlock()
-		data, err := c.fetch(nil)
+		data, err := c.fetch(context.Background(), nil)
 		if err != nil {
 			return 0, err
 		}
 		if len(data) == 0 {
-			time.Sleep(20 * time.Millisecond)
+			if c.idleWait == 0 {
+				c.idleWait = 3 * time.Millisecond
+			} else if c.idleWait < 100*time.Millisecond {
+				c.idleWait *= 2
+				if c.idleWait > 100*time.Millisecond {
+					c.idleWait = 100 * time.Millisecond
+				}
+			}
+			time.Sleep(c.idleWait)
 			continue
 		}
+		c.idleWait = 0
 		c.mu.Lock()
 		c.pending = append(c.pending, data...)
 		c.mu.Unlock()
@@ -353,7 +386,7 @@ func (c *assetConn) Write(p []byte) (int, error) {
 		if len(rest) < size {
 			size = len(rest)
 		}
-		data, err := c.fetch(rest[:size])
+		data, err := c.fetch(context.Background(), rest[:size])
 		if err != nil {
 			return total, err
 		}

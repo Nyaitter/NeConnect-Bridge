@@ -5,6 +5,7 @@ const fs = require('fs');
 const http = require('http');
 const net = require('net');
 const path = require('path');
+const { once } = require('events');
 const { WebSocketServer } = require('ws');
 
 const { loadConfig } = require('./config');
@@ -371,10 +372,13 @@ async function handleEventStream(req, res) {
     if (current === pipe) tunnelSessions.delete(sid);
   });
   while (active && !res.writableEnded) {
-    const chunk = await pipe.next(20000);
-    if (chunk === null) break;
-    if (chunk === undefined) continue;
-    res.write(`data: ${chunk.toString('base64')}\n\n`);
+    const first = await pipe.next(20000);
+    if (first === null) break;
+    if (first === undefined) continue;
+    const parts = [first];
+    while (pipe.chunks.length > 0) parts.push(pipe.chunks.shift());
+    const body = parts.length === 1 ? parts[0] : Buffer.concat(parts);
+    if (!res.write(`data: ${body.toString('base64')}\n\n`)) await once(res, 'drain');
   }
   clearInterval(ping);
   if (!res.writableEnded) res.end();
@@ -415,7 +419,7 @@ async function handleAsset(req, res) {
       // malformed payloads are ignored
     }
   }
-  const chunk = await pipe.next(1200);
+  const chunk = await pipe.next(0);
   const payload = chunk && chunk !== null ? chunk : Buffer.alloc(0);
   const body = pngFrame(payload);
   res.writeHead(200, {
@@ -500,10 +504,13 @@ async function handleH2(req, res) {
       if (tunnelSessions.get(sid) === pipe) tunnelSessions.delete(sid);
     });
     while (active && !res.writableEnded) {
-      const chunk = await pipe.next(20000);
-      if (chunk === null) break;
-      if (chunk === undefined) continue;
-      res.write(chunk);
+      const first = await pipe.next(20000);
+      if (first === null) break;
+      if (first === undefined) continue;
+      const parts = [first];
+      while (pipe.chunks.length > 0) parts.push(pipe.chunks.shift());
+      const body = parts.length === 1 ? parts[0] : Buffer.concat(parts);
+      if (!res.write(body)) await once(res, 'drain');
     }
     if (!res.writableEnded) res.end();
     return;

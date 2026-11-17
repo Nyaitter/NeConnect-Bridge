@@ -647,20 +647,44 @@ func (e *bridgeEngine) warmPool() error {
 	e.pool = make(chan net.Conn, poolSize)
 	e.pool <- first
 	e.noteRoute("wsPool:" + stage.label())
+	_ = e.fillPool()
+	logf("wsPool connected with %d streams via %s", len(e.pool), stage.label())
+	go e.refillLoop()
+	return nil
+}
 
+// fillPool は、足りない流れを並べて張る。
+func (e *bridgeEngine) fillPool() error {
+	missing := poolSize - len(e.pool)
+	if missing <= 0 || e.pool == nil {
+		return nil
+	}
 	deadline := time.Now().Add(poolWarmBudget)
+	var mu sync.Mutex
+	var firstErr error
 	var wg sync.WaitGroup
-	for i := 1; i < poolSize; i++ {
+	sem := make(chan struct{}, poolRefillMax)
+	for i := 0; i < missing; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					logf("pool warm dial stopped: %v", r)
+					logf("pool fill stopped: %v", r)
 				}
 			}()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if time.Now().After(deadline) {
+				return
+			}
 			c, _, derr := e.dialRawWS("speed", nil)
 			if derr != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = derr
+				}
+				mu.Unlock()
 				return
 			}
 			select {
@@ -670,18 +694,8 @@ func (e *bridgeEngine) warmPool() error {
 			}
 		}()
 	}
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Until(deadline)):
-	}
-	logf("wsPool connected with %d streams via %s", len(e.pool), stage.label())
-	go e.refillLoop()
-	return nil
+	wg.Wait()
+	return firstErr
 }
 
 // noteRoute は、実際につながった経路を覚えておく。
@@ -720,39 +734,32 @@ func (e *bridgeEngine) rawWSURL(mode string) (string, error) {
 
 // dialRawWS は、速いモードの流れを一本張る。
 func (e *bridgeEngine) dialRawWS(mode string, preferred []dialStage) (net.Conn, dialStage, error) {
-	var errs []string
-	deadline := time.Now().Add(methodBudget)
-	for _, stage := range e.td.order(preferred) {
-		if time.Now().After(deadline) {
-			errs = append(errs, "time budget spent")
-			break
-		}
-		raw, err := e.wsConn(mode, stage)
+	attempt := func(ctx context.Context, st dialStage) (net.Conn, error) {
+		raw, err := e.wsConn(ctx, mode, st)
 		if err != nil {
-			errs = append(errs, stage.label()+": "+err.Error())
-			continue
+			return nil, err
 		}
 		if mode != "speed" {
-			return raw, stage, nil
+			return raw, nil
 		}
 		// 速いモードは、流れごと暗号化して重ねる。
 		enc, eerr := e2e.WrapClient(raw)
 		if eerr != nil {
 			_ = raw.Close()
-			return nil, stage, eerr
+			return nil, eerr
 		}
-		return enc, stage, nil
+		return enc, nil
 	}
-	return nil, dialStage{}, noRouteErr(errs)
+	return raceStages(context.Background(), methodBudget, e.td.order(preferred), attempt)
 }
 
 // wsConn は、一つの道筋で WebSocket を張る。
-func (e *bridgeEngine) wsConn(mode string, stage dialStage) (net.Conn, error) {
+func (e *bridgeEngine) wsConn(ctx context.Context, mode string, stage dialStage) (net.Conn, error) {
 	wsURL, err := e.rawWSURL(mode)
 	if err != nil {
 		return nil, err
 	}
-	ws, err := e.dialWSStage(wsURL, stage)
+	ws, err := e.dialWSStage(ctx, wsURL, stage)
 	if err != nil {
 		return nil, err
 	}
@@ -760,7 +767,7 @@ func (e *bridgeEngine) wsConn(mode string, stage dialStage) (net.Conn, error) {
 }
 
 // dialWSStage は、WebSocket のやり取りを一つの道筋へ向ける。
-func (e *bridgeEngine) dialWSStage(wsURL string, stage dialStage) (*websocket.Conn, error) {
+func (e *bridgeEngine) dialWSStage(ctx context.Context, wsURL string, stage dialStage) (*websocket.Conn, error) {
 	u, err := url.Parse(wsURL)
 	if err != nil {
 		return nil, err
@@ -774,15 +781,15 @@ func (e *bridgeEngine) dialWSStage(wsURL string, stage dialStage) (*websocket.Co
 		}
 	}
 	d := &websocket.Dialer{
-		HandshakeTimeout:  8 * time.Second,
-		ReadBufferSize:    128 * 1024,
-		WriteBufferSize:   128 * 1024,
+		HandshakeTimeout:  6 * time.Second,
+		ReadBufferSize:    64 * 1024,
+		WriteBufferSize:   64 * 1024,
 		EnableCompression: false,
-		NetDialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return e.td.dialConn(ctx, stage, port, true, []string{"http/1.1"})
+		NetDialTLSContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
+			return e.td.dialConn(dctx, stage, port, true, []string{"http/1.1"})
 		},
-		NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return e.td.dialConn(ctx, stage, port, false, nil)
+		NetDialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
+			return e.td.dialConn(dctx, stage, port, false, nil)
 		},
 	}
 	if !secure {
@@ -790,7 +797,7 @@ func (e *bridgeEngine) dialWSStage(wsURL string, stage dialStage) (*websocket.Co
 	}
 	header := http.Header{}
 	header.Set("User-Agent", browserUA)
-	ws, resp, derr := d.DialContext(context.Background(), wsURL, header)
+	ws, resp, derr := d.DialContext(ctx, wsURL, header)
 	if derr != nil {
 		if resp != nil {
 			return nil, fmt.Errorf("%w (http %d)", derr, resp.StatusCode)
@@ -842,95 +849,103 @@ func (e *bridgeEngine) dialMethod(m connMethod) (*ssh.Client, string, error) {
 	preferred := stagesForParam(e.preferParam)
 	switch m.kind {
 	case methodWSTunnel:
-		return e.dialWSMethod(m.name, preferred, "secure")
+		return e.dialWSMethod(m.name, e.td.order(preferred), "secure")
 	case methodAltWS:
 		// 代替ポートと記録の分割を重ねた道筋から先に試す。
-		preferred = append(altFragStages(), preferred...)
-		return e.dialWSMethod(m.name, preferred, "secure")
+		stages := append(altFragStages(), preferred...)
+		return e.dialWSMethod(m.name, e.td.order(stages), "secure")
 	case methodAltPorts:
 		return e.dialAltPorts(m.name)
 	case methodH2Stream:
-		return e.dialStreamMethod(m.name, preferred, true, func(client *http.Client) (net.Conn, error) {
-			return h2tunnel.Dial(e.h2URL, client)
+		return e.dialStreamMethod(m.name, preferred, true, func(ctx context.Context, client *http.Client) (net.Conn, error) {
+			return h2tunnel.Dial(ctx, e.h2URL, client)
 		})
 	case methodHTTPRange:
-		return e.dialStreamMethod(m.name, preferred, false, func(client *http.Client) (net.Conn, error) {
-			return rangetunnel.Dial(e.rangeURL, client)
+		return e.dialStreamMethod(m.name, preferred, false, func(ctx context.Context, client *http.Client) (net.Conn, error) {
+			return rangetunnel.Dial(ctx, e.rangeURL, client)
 		})
 	case methodHTTPPoll:
-		return e.dialStreamMethod(m.name, preferred, false, func(client *http.Client) (net.Conn, error) {
-			return httptunnel.Dial(e.pollURL, client)
+		return e.dialStreamMethod(m.name, preferred, false, func(ctx context.Context, client *http.Client) (net.Conn, error) {
+			return httptunnel.Dial(ctx, e.pollURL, client)
 		})
 	case methodSSEForm:
 		origin, err := e.origin()
 		if err != nil {
 			return nil, "", err
 		}
-		return e.dialStreamMethod(m.name, preferred, false, func(client *http.Client) (net.Conn, error) {
-			return covert.DialSSE(origin, client)
+		return e.dialStreamMethod(m.name, preferred, false, func(ctx context.Context, client *http.Client) (net.Conn, error) {
+			return covert.DialSSE(ctx, origin, client)
 		})
 	case methodAssetCookie:
 		origin, err := e.origin()
 		if err != nil {
 			return nil, "", err
 		}
-		return e.dialStreamMethod(m.name, preferred, false, func(client *http.Client) (net.Conn, error) {
-			return covert.DialAsset(origin, client)
+		return e.dialStreamMethod(m.name, preferred, false, func(ctx context.Context, client *http.Client) (net.Conn, error) {
+			return covert.DialAsset(ctx, origin, client)
 		})
 	}
 	return nil, "", fmt.Errorf("unsupported method: %s", m.name)
 }
 
 // dialWSMethod は、WebSocket の上に難読化と SSH を重ねる。
-func (e *bridgeEngine) dialWSMethod(name string, preferred []dialStage, mode string) (*ssh.Client, string, error) {
-	var errs []string
-	deadline := time.Now().Add(methodBudget)
-	for _, stage := range e.td.order(preferred) {
-		if time.Now().After(deadline) {
-			errs = append(errs, "time budget spent")
-			break
-		}
-		raw, err := e.wsConn(mode, stage)
+func (e *bridgeEngine) dialWSMethod(name string, stages []dialStage, mode string) (*ssh.Client, string, error) {
+	attempt := func(ctx context.Context, st dialStage) (*ssh.Client, error) {
+		raw, err := e.wsConn(ctx, mode, st)
 		if err != nil {
-			errs = append(errs, stage.label()+": "+err.Error())
-			continue
+			return nil, err
 		}
-		c, cerr := e.obfsSSH(name+":"+stage.label(), raw)
+		if ctx.Err() != nil {
+			_ = raw.Close()
+			return nil, ctx.Err()
+		}
+		c, cerr := e.obfsSSH(name+":"+st.label(), raw)
 		if cerr != nil {
-			errs = append(errs, stage.label()+": "+cerr.Error())
-			continue
+			return nil, cerr
 		}
-		return c, name + ":" + stage.label(), nil
+		if ctx.Err() != nil {
+			_ = c.Close()
+			return nil, ctx.Err()
+		}
+		return c, nil
 	}
-	return nil, "", noRouteErr(errs)
+	c, stage, err := raceStages(context.Background(), methodBudget, stages, attempt)
+	if err != nil {
+		return nil, "", err
+	}
+	return c, name + ":" + stage.label(), nil
 }
 
 // dialStreamMethod は、HTTP のやり取りの上に難読化と SSH を重ねる。
-func (e *bridgeEngine) dialStreamMethod(name string, preferred []dialStage, h2 bool, open func(*http.Client) (net.Conn, error)) (*ssh.Client, string, error) {
-	var errs []string
-	deadline := time.Now().Add(methodBudget)
-	for _, stage := range e.td.order(preferred) {
-		if time.Now().After(deadline) {
-			errs = append(errs, "time budget spent")
-			break
-		}
-		raw, err := open(e.td.httpClient(stage, 0, h2))
+func (e *bridgeEngine) dialStreamMethod(name string, preferred []dialStage, h2 bool, open func(context.Context, *http.Client) (net.Conn, error)) (*ssh.Client, string, error) {
+	attempt := func(ctx context.Context, st dialStage) (*ssh.Client, error) {
+		raw, err := open(ctx, e.td.httpClient(st, 0, h2))
 		if err != nil {
-			errs = append(errs, stage.label()+": "+err.Error())
 			if errors.Is(err, endpoint.ErrUnavailable) {
 				// この受け口が無いブリッジでは、道筋を変えても答えは変わらない。
-				break
+				return nil, err
 			}
-			continue
+			return nil, err
 		}
-		c, cerr := e.obfsSSH(name+":"+stage.label(), raw)
+		if ctx.Err() != nil {
+			_ = raw.Close()
+			return nil, ctx.Err()
+		}
+		c, cerr := e.obfsSSH(name+":"+st.label(), raw)
 		if cerr != nil {
-			errs = append(errs, stage.label()+": "+cerr.Error())
-			continue
+			return nil, cerr
 		}
-		return c, name + ":" + stage.label(), nil
+		if ctx.Err() != nil {
+			_ = c.Close()
+			return nil, ctx.Err()
+		}
+		return c, nil
 	}
-	return nil, "", noRouteErr(errs)
+	c, stage, err := raceStages(context.Background(), methodBudget, e.td.order(preferred), attempt)
+	if err != nil {
+		return nil, "", err
+	}
+	return c, name + ":" + stage.label(), nil
 }
 
 // dialAltPorts は、代替ポートの上に難読化と SSH を重ねる。
@@ -939,26 +954,11 @@ func (e *bridgeEngine) dialAltPorts(name string) (*ssh.Client, string, error) {
 	if e.preferParam != "" {
 		ports = []string{e.preferParam}
 	}
-	var errs []string
-	deadline := time.Now().Add(methodBudget)
+	stages := make([]dialStage, 0, len(ports))
 	for _, port := range ports {
-		if time.Now().After(deadline) {
-			errs = append(errs, "time budget spent")
-			break
-		}
-		raw, err := e.wsConn("secure", dialStage{port: port})
-		if err != nil {
-			errs = append(errs, port+": "+err.Error())
-			continue
-		}
-		c, cerr := e.obfsSSH(name+":"+port, raw)
-		if cerr != nil {
-			errs = append(errs, port+": "+cerr.Error())
-			continue
-		}
-		return c, name + ":" + port, nil
+		stages = append(stages, dialStage{port: port})
 	}
-	return nil, "", noRouteErr(errs)
+	return e.dialWSMethod(name, e.td.only(stages), "secure")
 }
 
 func (e *bridgeEngine) origin() (string, error) {
@@ -1036,7 +1036,7 @@ func (e *bridgeEngine) sshKeepaliveLoop() {
 }
 
 func (e *bridgeEngine) refillLoop() {
-	ticker := time.NewTicker(300 * time.Millisecond)
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	defer func() {
 		if r := recover(); r != nil {
@@ -1062,8 +1062,7 @@ func (e *bridgeEngine) refillLoop() {
 			if e.pool == nil || len(e.pool) >= poolLowWater {
 				continue
 			}
-			c, _, err := e.dialRawWS("speed", nil)
-			if err != nil {
+			if err := e.fillPool(); err != nil {
 				failures++
 				backoff := time.Duration(failures) * 500 * time.Millisecond
 				if backoff > 8*time.Second {
@@ -1074,11 +1073,6 @@ func (e *bridgeEngine) refillLoop() {
 				continue
 			}
 			failures = 0
-			select {
-			case e.pool <- c:
-			default:
-				_ = c.Close()
-			}
 		}
 	}
 }

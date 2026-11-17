@@ -15,7 +15,13 @@ import (
 )
 
 // maxBatch は、1回の送信にまとめる量の上限。
-const maxBatch = 128 * 1024
+const maxBatch = 256 * 1024
+
+// 小さい書き込みが続くときは、少しだけ待って同じ送信にまとめる。
+const (
+	coalesceWait = time.Millisecond
+	coalesceMin  = 16 * 1024
+)
 
 // uploadWait は、1回の送信にかける待ち時間の上限。
 const uploadWait = 30 * time.Second
@@ -37,7 +43,7 @@ type Conn struct {
 
 // Dial は、下りは一続きの受信、上りはその横に並べた送信で中継を開く。
 // どちらも同じ HTTP/2 の接続の上に置く。
-func Dial(baseURL string, client *http.Client) (net.Conn, error) {
+func Dial(ctx context.Context, baseURL string, client *http.Client) (net.Conn, error) {
 	if client == nil {
 		return nil, errors.New("http client is required")
 	}
@@ -45,7 +51,7 @@ func Dial(baseURL string, client *http.Client) (net.Conn, error) {
 		return nil, errors.New("stream url is empty")
 	}
 	sid := endpoint.NewSessionID()
-	if err := endpoint.Open(client, baseURL, "h2", sid); err != nil {
+	if err := endpoint.Open(ctx, client, baseURL, "h2", sid); err != nil {
 		return nil, err
 	}
 	c := &Conn{
@@ -130,6 +136,23 @@ func (c *Conn) upLoop() {
 			default:
 				break collect
 			}
+		}
+		// まだ小さいうちは、少しだけ続きを待つ。
+		if len(batch) < coalesceMin {
+			timer := time.NewTimer(coalesceWait)
+		wait:
+			for len(batch) < maxBatch {
+				select {
+				case more := <-c.writes:
+					batch = append(batch, more...)
+				case <-timer.C:
+					break wait
+				case <-c.done:
+					timer.Stop()
+					return
+				}
+			}
+			timer.Stop()
 		}
 		if err := c.upload(batch); err != nil {
 			// 送り始めを断られたときは、この形を受け付けない相手とみなす。

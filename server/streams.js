@@ -79,9 +79,11 @@ function joinStreams(a, b) {
   b.once('close', () => settle(a));
 }
 
+const STREAM_WATERMARK = 64 * 1024;
+
 class SocketDuplex extends Duplex {
   constructor(socket) {
-    super();
+    super({ highWaterMark: STREAM_WATERMARK });
     this.socket = socket;
     socket.setNoDelay(true);
     socket.on('data', (chunk) => {
@@ -118,10 +120,10 @@ class SocketDuplex extends Duplex {
 
 class WsDuplex extends Duplex {
   constructor(ws) {
-    super();
+    super({ highWaterMark: STREAM_WATERMARK });
     this.ws = ws;
     ws.on('message', (data) => {
-      this.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
+      if (!this.push(Buffer.isBuffer(data) ? data : Buffer.from(data))) ws.pause();
     });
     ws.on('close', () => {
       if (!this.readableEnded) this.push(null);
@@ -129,7 +131,9 @@ class WsDuplex extends Duplex {
     ws.on('error', (err) => this.destroy(err));
   }
 
-  _read() {}
+  _read() {
+    this.ws.resume();
+  }
 
   _write(chunk, _encoding, callback) {
     if (this.ws.readyState !== this.ws.OPEN) {
@@ -186,7 +190,7 @@ function publicKeyToRaw(keyObject) {
 
 class AeadDuplex extends Duplex {
   constructor(inner, readKey, writeKey) {
-    super();
+    super({ highWaterMark: STREAM_WATERMARK });
     this.inner = inner;
     this.readKey = readKey;
     this.writeKey = writeKey;
@@ -194,7 +198,7 @@ class AeadDuplex extends Duplex {
     this.writeSeq = 0;
     this.pending = Buffer.alloc(0);
     inner.on('data', (chunk) => {
-      this.pending = Buffer.concat([this.pending, chunk]);
+      this.pending = this.pending.length === 0 ? chunk : Buffer.concat([this.pending, chunk]);
       this.drain();
     });
     inner.on('end', () => {
@@ -233,11 +237,17 @@ class AeadDuplex extends Duplex {
         this.destroy(new Error('encrypted frame failed to authenticate'));
         return;
       }
-      this.push(plain);
+      if (!this.push(plain)) {
+        this.inner.pause();
+        return;
+      }
     }
   }
 
-  _read() {}
+  _read() {
+    this.inner.resume();
+    if (this.pending.length >= 4) this.drain();
+  }
 
   _write(chunk, _encoding, callback) {
     const frames = [];
@@ -301,11 +311,13 @@ async function wrapServerAead(inner, serverPrivateKey) {
 
 class ObfsDuplex extends Duplex {
   constructor(inner, readCipher, writeCipher) {
-    super();
+    super({ highWaterMark: STREAM_WATERMARK });
     this.inner = inner;
     this.readCipher = readCipher;
     this.writeCipher = writeCipher;
-    inner.on('data', (chunk) => this.push(readCipher.xor(chunk)));
+    inner.on('data', (chunk) => {
+      if (!this.push(readCipher.xor(chunk))) inner.pause();
+    });
     inner.on('end', () => {
       if (!this.readableEnded) this.push(null);
     });
@@ -315,7 +327,9 @@ class ObfsDuplex extends Duplex {
     });
   }
 
-  _read() {}
+  _read() {
+    this.inner.resume();
+  }
 
   _write(chunk, _encoding, callback) {
     this.inner.write(this.writeCipher.xor(chunk));

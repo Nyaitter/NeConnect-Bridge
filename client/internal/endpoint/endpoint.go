@@ -28,8 +28,8 @@ func NewSessionID() string {
 }
 
 // Open は受け口を開き、このブリッジで使えるかを短く確かめる。
-func Open(client *http.Client, base, transport, sid string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+func Open(parent context.Context, client *http.Client, base, transport, sid string) error {
+	ctx, cancel := context.WithTimeout(parent, 12*time.Second)
 	defer cancel()
 	req, err := Request(ctx, "POST", base, sid, "open", nil)
 	if err != nil {
