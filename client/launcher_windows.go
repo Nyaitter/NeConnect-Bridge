@@ -18,11 +18,10 @@ const (
 	targetChrome  = 0
 	targetEdge    = 1
 	targetBrowser = 2
-	targetBash    = 3
-	targetApp     = 4
+	targetApp     = 3
 )
 
-var targetLabels = []string{"Chrome", "Edge", "NCTB Browser", "NCTB Bash", "任意のアプリケーション"}
+var targetLabels = []string{"Chrome", "Edge", "NCTB Browser", "任意のアプリケーション"}
 
 func chromiumCandidates() []string {
 	pf := os.Getenv("ProgramFiles")
@@ -139,38 +138,6 @@ func downloadFile(socksPort int, rawURL, dest string, setStatus func(string), la
 	return try(&http.Client{Timeout: 15 * time.Minute}, "direct")
 }
 
-// ensureBusybox は内蔵シェル用の単体実行ファイルを用意する。
-func ensureBusybox(dir string, socksPort int, setStatus func(string)) (string, error) {
-	runtimeDir := filepath.Join(dir, "runtime")
-	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
-		return "", err
-	}
-	dest := filepath.Join(runtimeDir, "nctb-bash.exe")
-	if st, err := os.Stat(dest); err == nil && st.Size() > 100*1024 {
-		return dest, nil
-	}
-	setStatus("シェルを準備中...")
-	urls := []string{
-		"https://frippery.org/files/busybox/busybox64u.exe",
-		"https://frippery.org/files/busybox/busybox64.exe",
-	}
-	var lastErr error
-	for _, u := range urls {
-		if err := downloadFile(socksPort, u, dest, setStatus, "シェル"); err == nil {
-			if st, err := os.Stat(dest); err == nil && st.Size() > 100*1024 {
-				return dest, nil
-			}
-		} else {
-			lastErr = err
-			logf("busybox download failed (%s): %v", u, err)
-		}
-	}
-	if lastErr == nil {
-		lastErr = errors.New("取得できませんでした")
-	}
-	return "", lastErr
-}
-
 func chromiumArgs(socksPort int, profileDir string) []string {
 	port := fmt.Sprintf("%d", socksPort)
 	args := []string{}
@@ -247,14 +214,6 @@ func resolveLaunchExe(dir string, req launchRequest, socksPort int, setStatus fu
 		profile := filepath.Join(dir, "profile-nctb")
 		_ = os.MkdirAll(profile, 0755)
 		return exe, chromiumArgs(socksPort, profile), filepath.Dir(exe), false, nil
-	case targetBash:
-		exe, err := ensureBusybox(dir, socksPort, setStatus)
-		if err != nil {
-			return "", nil, "", false, err
-		}
-		home := filepath.Join(dir, "shell-home")
-		_ = os.MkdirAll(home, 0755)
-		return exe, []string{"sh"}, filepath.Dir(exe), true, nil
 	default:
 		p := strings.Trim(strings.TrimSpace(req.appPath), `"`)
 		if p == "" {

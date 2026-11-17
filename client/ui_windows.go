@@ -3,14 +3,14 @@ package main
 import (
 	"os"
 	"path/filepath"
-
-	"neconnectbridge/internal/logqueue"
 	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
+
+	"neconnectbridge/internal/logqueue"
 )
 
 var (
@@ -887,7 +887,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 			w, h := uintptr(760), uintptr(460)
 			x := (sw - w) / 2
 			y := (sh - h) / 2
-			ui.logHwnd, _, _ = procCreateWindowExW.Call(
+			hLog, _, _ := procCreateWindowExW.Call(
 				0,
 				uintptr(unsafe.Pointer(logClass)),
 				uintptr(unsafe.Pointer(u16("ログ"))),
@@ -895,6 +895,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 				x, y, w, h,
 				0, 0, hInst, 0,
 			)
+			ui.logHwnd = hLog
 			if len(ui.logLines) == 0 {
 				loadLogTail(800)
 			}
@@ -1133,7 +1134,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 	x := (sw - w) / 2
 	y := (sh - h) / 2
 
-	ui.hwnd, _, _ = procCreateWindowExW.Call(
+	hMain, _, _ := procCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(u16("NeConnect Bridge"))),
@@ -1141,6 +1142,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 		x, y, w, h,
 		0, 0, hInst, 0,
 	)
+	ui.setWindowHandle(hMain)
 
 	hFont, _, _ := procGetStockObject.Call(defaultGuiFnt)
 

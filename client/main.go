@@ -181,7 +181,8 @@ func loadConfig(dir string) Config {
 		saveConfig(dir, cfg)
 	}
 	if cfg.TargetIdx < 0 || cfg.TargetIdx > targetApp {
-		cfg.TargetIdx = targetBrowser
+		// 選べる対象が減ったときは、アプリ指定として扱う。
+		cfg.TargetIdx = targetApp
 	}
 	return cfg
 }
@@ -1240,8 +1241,6 @@ func launchRequestFromValue(v string, cfg Config) launchRequest {
 		return launchRequest{kind: targetEdge}
 	case "browser":
 		return launchRequest{kind: targetBrowser}
-	case "bash":
-		return launchRequest{kind: targetBash}
 	case "":
 		return launchRequest{kind: cfg.TargetIdx, appPath: cfg.AppPath}
 	default:
@@ -1258,8 +1257,6 @@ func shortcutPreset(dir string, kind int, appPath string) (argValue, iconExe, di
 		return "edge", detectEdge(), "Edge", ""
 	case targetBrowser:
 		return "browser", filepath.Join(dir, "runtime", "chrome-win64", "chrome.exe"), "NCTB Browser", ""
-	case targetBash:
-		return "bash", filepath.Join(dir, "runtime", "nctb-bash.exe"), "NCTB Bash", ""
 	default:
 		p := strings.Trim(strings.TrimSpace(appPath), `"`)
 		if p == "" {
