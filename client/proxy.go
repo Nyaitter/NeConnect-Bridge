@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"neconnectbridge/internal/relaylog"
 )
 
 // 手元の入口。SOCKS5・SOCKS4・HTTP のどれで来ても同じ中継へ流す。
@@ -73,42 +75,9 @@ func handleLocalConn(c net.Conn, dialTarget func(string) (net.Conn, error), pool
 }
 
 // relay は両方向を中継する。片方が終わっても、もう片方の続きを打ち切らない。
+// 手元の側が自分から切っただけのときは記録に残さず、中継先の失敗だけを知らせる。
 func relay(label string, browser, remote net.Conn, pool *sync.Pool) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-	copyHalf := func(tag string, dst, src net.Conn) {
-		defer wg.Done()
-		defer func() {
-			if r := recover(); r != nil {
-				logf("%s copy %s stopped: %v", label, tag, r)
-			}
-		}()
-		var buf []byte
-		if pool != nil {
-			bp := pool.Get().(*[]byte)
-			buf = *bp
-			defer pool.Put(bp)
-		} else {
-			buf = make([]byte, 32*1024)
-		}
-		n, cerr := io.CopyBuffer(dst, src, buf)
-		if cerr != nil {
-			if !errors.Is(cerr, net.ErrClosed) {
-				logf("%s copy %s ended after %d bytes: %v", label, tag, n, cerr)
-			}
-			// 途中で切れたときだけ、両側を閉じる。
-			_ = dst.Close()
-			_ = src.Close()
-			return
-		}
-		// 読み手が送り終えた。送り先にも終わりを伝え、反対向きの返事は待つ。
-		if hc, ok := dst.(interface{ CloseWrite() error }); ok {
-			_ = hc.CloseWrite()
-		}
-	}
-	go copyHalf("up", remote, browser)
-	go copyHalf("down", browser, remote)
-	wg.Wait()
+	relaylog.Relay(label, browser, remote, pool, logf)
 }
 
 func handleSOCKS5(c net.Conn, dialTarget func(string) (net.Conn, error), pool *sync.Pool) {
