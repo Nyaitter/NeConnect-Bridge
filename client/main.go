@@ -1346,10 +1346,15 @@ func runLaunchMode(dir string, cfg Config, signer ssh.Signer, req launchRequest)
 		logf("launch: using running entry port=%d", port)
 	} else {
 		own = newSession(dir, signer)
-		if _, err := own.connect(cfg.ServerURL, cfg.Route, false, status); err != nil {
-			logf("launch connect failed: %v", err)
-			showError("NeConnect Bridge", fmt.Sprintf("接続できませんでした:\n%v", err))
+		route, cerr := own.connect(cfg.ServerURL, cfg.Route, false, status)
+		if cerr != nil {
+			logf("launch connect failed: %v", cerr)
+			showError("NeConnect Bridge", fmt.Sprintf("接続できませんでした:\n%v", cerr))
 			return
+		}
+		if route != nil {
+			cfg.Route = route
+			saveConfig(dir, cfg)
 		}
 		port = own.socksPort()
 	}
