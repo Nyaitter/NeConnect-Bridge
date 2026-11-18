@@ -1181,8 +1181,8 @@ type targetStream struct {
 func (t *targetStream) Close() error {
 	t.once.Do(func() {
 		t.engine.forgetStream(t)
-		if t.engine.guard.NoteClosed(t.host, time.Since(t.started)) {
-			logf("%s への接続がすぐ切れ続けているため、しばらく中継しません（%s）", t.host, hostguard.CoolDown)
+		if rest := t.engine.guard.NoteClosed(t.host, time.Since(t.started)); rest > 0 {
+			logf("%s への接続がすぐ切れ続けているため、しばらく中継しません（%s）", t.host, rest)
 		}
 	})
 	return t.Conn.Close()
@@ -1235,14 +1235,16 @@ func (e *bridgeEngine) dialTarget(target string) (net.Conn, error) {
 		}
 		return nil, &errHostCooling{host: host, left: left}
 	}
-	if e.guard.NoteAttempt(host) {
-		logf("%s への接続が集中したため、しばらく中継しません（%s）", host, hostguard.CoolDown)
+	if rest := e.guard.NoteAttempt(host); rest > 0 {
+		logf("%s への接続が集中したため、しばらく中継しません（%s）", host, rest)
 	}
 
 	conn, err := e.dialTargetStream(target)
 	if err != nil {
-		if e.ctx.Err() == nil && e.guard.NoteFailure(host) {
-			logf("%s へつながらない状態が続いているため、しばらく中継しません（%s）", host, hostguard.CoolDown)
+		if e.ctx.Err() == nil {
+			if rest := e.guard.NoteFailure(host); rest > 0 {
+				logf("%s へつながらない状態が続いているため、しばらく中継しません（%s）", host, rest)
+			}
 		}
 		return nil, err
 	}
