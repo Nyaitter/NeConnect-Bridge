@@ -468,6 +468,14 @@ static int WSAAPI hook_connect(SOCKET s, const struct sockaddr *name, int namele
 	if (!name || g_port <= 0)
 		return g_connect(s, name, namelen);
 
+	/* 中継が受け持つのは TCP だけ。UDP はそのまま通す。 */
+	{
+		int type = 0;
+		int type_len = sizeof(type);
+		if (getsockopt(s, SOL_SOCKET, SO_TYPE, (char *)&type, &type_len) == 0 && type != SOCK_STREAM)
+			return g_connect(s, name, namelen);
+	}
+
 	if (name->sa_family == AF_INET && namelen >= (int)sizeof(struct sockaddr_in)) {
 		const struct sockaddr_in *in = (const struct sockaddr_in *)name;
 		unsigned int ip = ntohl(in->sin_addr.s_addr);
