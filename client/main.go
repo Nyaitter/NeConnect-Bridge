@@ -34,6 +34,7 @@ import (
 	"neconnectbridge/internal/obfs"
 	"neconnectbridge/internal/rangetunnel"
 	"neconnectbridge/internal/selfupdate"
+	"neconnectbridge/internal/singleinst"
 	"neconnectbridge/internal/wsconn"
 )
 
@@ -1390,16 +1391,15 @@ func runBounded(name string, limit time.Duration, fn func()) {
 
 // parseLaunchArgs は --launch 指定を読み取る。
 func parseLaunchArgs(args []string, cfg Config) (launchRequest, bool) {
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--launch" || args[i] == "/launch" {
-			val := ""
-			if i+1 < len(args) {
-				val = args[i+1]
-			}
-			return launchRequestFromValue(val, cfg), true
-		}
+	i := singleinst.LaunchFlagIndex(args)
+	if i < 0 {
+		return launchRequest{}, false
 	}
-	return launchRequest{}, false
+	val := ""
+	if i+1 < len(args) {
+		val = args[i+1]
+	}
+	return launchRequestFromValue(val, cfg), true
 }
 
 func launchRequestFromValue(v string, cfg Config) launchRequest {
@@ -1721,6 +1721,12 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 func main() {
 	dir := exeDir()
 	initLogger(dir)
+	// 画面を出す起動では、二重に開かない。
+	// 既に開いていれば、そちらの窓を通常表示へ戻して、このプロセスは何もせずに終わる。
+	// 起動役（--launch）は画面を出さないので、そのまま並んで動かす。
+	if !singleinst.IsLauncherInvocation(os.Args[1:]) && !claimWindowInstance() {
+		return
+	}
 	cfg := loadConfig(dir)
 	// 前回の差し替えで残ったものを片づける。
 	if self, err := os.Executable(); err == nil {

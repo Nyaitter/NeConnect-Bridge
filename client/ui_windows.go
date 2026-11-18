@@ -334,6 +334,10 @@ type scrollInfo struct {
 
 const sifAll = 0x00000017
 
+// mainWindowClass は、本体の窓の種類の名前。
+// 二重起動したときに、先に開いている窓を探すのにも使う。
+const mainWindowClass = "NeConnectBridgeWnd"
+
 // u16 は、文字列を Windows の文字列に直す。
 // 途中に入れられない文字が混ざっていても、落とさずに置き換えて渡す。
 func u16(s string) *uint16 {
@@ -594,7 +598,7 @@ func mkButton(parent uintptr, text string, px, py, pw, ph int, id int, hFont uin
 func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 	runtime.LockOSThread()
 	hInst, _, _ := procGetModuleHandleW.Call(0)
-	className := u16("NeConnectBridgeWnd")
+	className := u16(mainWindowClass)
 	logClass := u16("NeConnectBridgeLogWnd")
 
 	ui := &mainUI{runState: -1, hooks: hooks, logs: logqueue.New(4000)}
@@ -831,6 +835,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 		return ret
 	})
 	taskbarCreatedMsg, _, _ := procRegisterMsgW.Call(uintptr(unsafe.Pointer(u16("TaskbarCreated"))))
+	showMsg := showWindowMessage()
 
 	syncTarget := func() {
 		sel, _, _ := procSendMessageW.Call(ui.targetCombo, cbGetCurSel, 0, 0)
@@ -990,6 +995,11 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 				ui.trayAdded = false
 				addTray()
 			}
+			return 0
+		}
+		if showMsg != 0 && msg == showMsg {
+			// 二重に起動されたときは、通知領域から通常表示へ戻す。
+			restoreFromTray()
 			return 0
 		}
 		switch msg {
