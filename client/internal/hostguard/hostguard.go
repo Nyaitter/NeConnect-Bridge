@@ -27,6 +27,11 @@ const (
 	// CoolDown は、集中した相手を休ませる長さ。
 	CoolDown = 10 * time.Second
 
+	// 同じ相手がまた集中したときは、休ませる長さを倍にして延ばす。
+	// ここを過ぎるまでに再び集中しなければ、長さは元に戻る。
+	restMemory = 2 * time.Minute
+	maxRests   = 3
+
 	// 覚えておく相手の数の目安。これを超えたら古いものから忘れる。
 	maxHosts = 512
 )
@@ -44,6 +49,8 @@ type entry struct {
 	attempts []time.Time
 	fails    []time.Time
 	until    time.Time
+	lastRest time.Time
+	rests    int
 	rejected int
 }
 
@@ -78,10 +85,10 @@ func (g *Guard) Resting(host string) bool {
 }
 
 // NoteAttempt は、これから一本つなぐことを記録する。
-// その結果として相手を休ませ始めたときは true を返す。
-func (g *Guard) NoteAttempt(host string) bool {
+// その結果として相手を休ませ始めたときは、休ませる長さを返す。休ませていなければ 0。
+func (g *Guard) NoteAttempt(host string) time.Duration {
 	if host == "" {
-		return false
+		return 0
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -89,51 +96,49 @@ func (g *Guard) NoteAttempt(host string) bool {
 	now := g.now()
 	if now.Before(e.until) {
 		// 休ませている最中の試行は数えない。
-		return false
+		return 0
 	}
 	e.attempts = append(e.attempts, now)
 	e.attempts = prune(e.attempts, now.Add(-burstWindow))
 	if len(e.attempts) >= burstLimit {
-		g.rest(host, e)
-		return true
+		return g.rest(e)
 	}
-	return false
+	return 0
 }
 
 // NoteFailure は、つなげなかったことを記録する。
-// その結果として相手を休ませ始めたときは true を返す。
-func (g *Guard) NoteFailure(host string) bool {
+// その結果として相手を休ませ始めたときは、休ませる長さを返す。休ませていなければ 0。
+func (g *Guard) NoteFailure(host string) time.Duration {
 	return g.noteShort(host)
 }
 
 // NoteClosed は、つないだ接続がどれだけ続いたかを記録する。
 // すぐ切れた接続は失敗と同じように数える。
-// その結果として相手を休ませ始めたときは true を返す。
-func (g *Guard) NoteClosed(host string, lived time.Duration) bool {
+// その結果として相手を休ませ始めたときは、休ませる長さを返す。休ませていなければ 0。
+func (g *Guard) NoteClosed(host string, lived time.Duration) time.Duration {
 	if lived >= shortLivedSpan {
-		return false
+		return 0
 	}
 	return g.noteShort(host)
 }
 
-func (g *Guard) noteShort(host string) bool {
+func (g *Guard) noteShort(host string) time.Duration {
 	if host == "" {
-		return false
+		return 0
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	e := g.entry(host)
 	now := g.now()
 	if now.Before(e.until) {
-		return false
+		return 0
 	}
 	e.fails = append(e.fails, now)
 	e.fails = prune(e.fails, now.Add(-failWindow))
 	if len(e.fails) >= failLimit {
-		g.rest(host, e)
-		return true
+		return g.rest(e)
 	}
-	return false
+	return 0
 }
 
 // NoteRejected は、休ませている間に断った回数を数え、その回数を返す。
@@ -145,12 +150,25 @@ func (g *Guard) NoteRejected(host string) int {
 	return e.rejected
 }
 
-// rest は、相手をしばらく休ませる。数えた記録は消して、明けた直後に
-// また同じ集中で止まらないようにする。呼び出し側で鍵を持つ。
-func (g *Guard) rest(host string, e *entry) {
-	e.until = g.now().Add(CoolDown)
+// rest は、相手をしばらく休ませ、その長さを返す。数えた記録は消して、
+// 明けた直後にまた同じ集中で止まらないようにする。呼び出し側で鍵を持つ。
+// 短い間にまた集中した相手は、倍ずつ長く休ませる。
+func (g *Guard) rest(e *entry) time.Duration {
+	now := g.now()
+	if e.rests > 0 && now.Sub(e.lastRest) <= restMemory && e.rests < maxRests {
+		e.rests++
+	} else if now.Sub(e.lastRest) > restMemory {
+		e.rests = 1
+	}
+	if e.rests == 0 {
+		e.rests = 1
+	}
+	cool := CoolDown << (e.rests - 1)
+	e.until = now.Add(cool)
+	e.lastRest = now
 	e.attempts = nil
 	e.fails = nil
+	return cool
 }
 
 // entry は、相手の記録を取り出す。無ければ作り、多すぎれば忘れる。
