@@ -147,7 +147,9 @@ func handleSOCKS5(c net.Conn, dialTarget func(string) (net.Conn, error), pool *s
 
 	remote, err := dialTarget(target)
 	if err != nil {
-		logf("SOCKS5 dialTarget %s failed: %v", target, err)
+		if !quietDialError(err) {
+			logf("SOCKS5 dialTarget %s failed: %v", target, err)
+		}
 		_, _ = c.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
@@ -198,7 +200,9 @@ func handleSOCKS4(c net.Conn, dialTarget func(string) (net.Conn, error), pool *s
 
 	remote, err := dialTarget(target)
 	if err != nil {
-		logf("SOCKS4 dialTarget %s failed: %v", target, err)
+		if !quietDialError(err) {
+			logf("SOCKS4 dialTarget %s failed: %v", target, err)
+		}
 		_, _ = c.Write([]byte{0x00, 0x5B, 0, 0, 0, 0, 0, 0})
 		return
 	}
@@ -251,7 +255,9 @@ func handleHTTPProxy(c *bufferedConn, br *bufio.Reader, dialTarget func(string) 
 		}
 		remote, derr := dialTarget(addr)
 		if derr != nil {
-			logf("HTTP CONNECT %s failed: %v", addr, derr)
+			if !quietDialError(derr) {
+				logf("HTTP CONNECT %s failed: %v", addr, derr)
+			}
 			writeHTTPError(c, 502, "Bad Gateway")
 			return
 		}
@@ -297,7 +303,9 @@ func handleHTTPProxy(c *bufferedConn, br *bufio.Reader, dialTarget func(string) 
 
 	remote, derr := dialTarget(addr)
 	if derr != nil {
-		logf("HTTP %s %s failed: %v", method, addr, derr)
+		if !quietDialError(derr) {
+			logf("HTTP %s %s failed: %v", method, addr, derr)
+		}
 		writeHTTPError(c, 502, "Bad Gateway")
 		return
 	}
@@ -310,6 +318,13 @@ func handleHTTPProxy(c *bufferedConn, br *bufio.Reader, dialTarget func(string) 
 		return
 	}
 	relay("HTTP "+addr, c, remote, pool)
+}
+
+// quietDialError は、記録に残さずに断ってよい失敗かを返す。
+// 接続が集中した相手を休ませている間の断りは、ここでは残さない。
+func quietDialError(err error) bool {
+	var cooling *errHostCooling
+	return errors.As(err, &cooling)
 }
 
 func writeHTTPError(c net.Conn, code int, text string) {

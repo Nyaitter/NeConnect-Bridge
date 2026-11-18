@@ -24,10 +24,12 @@ import (
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
 	"neconnectbridge/internal/covert"
+	"neconnectbridge/internal/dialgate"
 	"neconnectbridge/internal/dohres"
 	"neconnectbridge/internal/e2e"
 	"neconnectbridge/internal/endpoint"
 	"neconnectbridge/internal/h2tunnel"
+	"neconnectbridge/internal/hostguard"
 	"neconnectbridge/internal/httptunnel"
 	"neconnectbridge/internal/obfs"
 	"neconnectbridge/internal/rangetunnel"
@@ -491,6 +493,17 @@ type bridgeEngine struct {
 	pool        chan net.Conn
 	stopCh      chan struct{}
 	closed      bool
+
+	// ctx は、閉じたときに進行中の張り出しをすべて打ち切るための合図。
+	ctx    context.Context
+	cancel context.CancelFunc
+	// gate は、同時に張り出す流れの本数を絞る。
+	gate *dialgate.Gate
+	// guard は、接続が集中した相手をしばらく休ませる。
+	guard *hostguard.Guard
+	// streams は、いま中継している接続。閉じるときに一緒に切る。
+	streams   map[*targetStream]struct{}
+	streamsMu sync.Mutex
 }
 
 type methodKind int
@@ -568,6 +581,7 @@ func officialHostKeyCallback() ssh.HostKeyCallback {
 }
 
 func newEngineBase(wsBase, pollURL string, signer ssh.Signer) *bridgeEngine {
+	ctx, cancel := context.WithCancel(context.Background())
 	e := &bridgeEngine{
 		wsBase:   wsBase,
 		pollURL:  pollURL,
@@ -580,7 +594,12 @@ func newEngineBase(wsBase, pollURL string, signer ssh.Signer) *bridgeEngine {
 			HostKeyAlgorithms: []string{ssh.KeyAlgoED25519},
 			Timeout:           8 * time.Second,
 		},
-		stopCh: make(chan struct{}),
+		stopCh:  make(chan struct{}),
+		ctx:     ctx,
+		cancel:  cancel,
+		gate:    dialgate.New(dialSlots, dialQueue),
+		guard:   hostguard.New(),
+		streams: map[*targetStream]struct{}{},
 	}
 	host := ""
 	if u, err := url.Parse(wsBase); err == nil {
@@ -672,9 +691,10 @@ func (e *bridgeEngine) warmPool() error {
 }
 
 // fillPool は、足りない流れを並べて張る。
+// 接続を閉じたあとは、新しい張り出しを残さない。
 func (e *bridgeEngine) fillPool(parallel int) error {
 	missing := poolSize - len(e.pool)
-	if missing <= 0 || e.pool == nil {
+	if missing <= 0 || e.pool == nil || e.ctx.Err() != nil {
 		return nil
 	}
 	deadline := time.Now().Add(poolWarmBudget)
@@ -693,11 +713,15 @@ func (e *bridgeEngine) fillPool(parallel int) error {
 			}()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			if time.Now().After(deadline) {
+			if e.ctx.Err() != nil || time.Now().After(deadline) {
 				return
 			}
 			c, _, derr := e.dialRawWS("speed", nil)
 			if derr != nil {
+				// 閉じただけのときは、失敗として記録に残さない。
+				if e.ctx.Err() != nil {
+					return
+				}
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = derr
@@ -751,7 +775,13 @@ func (e *bridgeEngine) rawWSURL(mode string) (string, error) {
 }
 
 // dialRawWS は、速いモードの流れを一本張る。
+// 同時に張り出す本数は絞り、閉じたあとは新しい張り出しを始めない。
 func (e *bridgeEngine) dialRawWS(mode string, preferred []dialStage) (net.Conn, dialStage, error) {
+	release, err := e.gate.Acquire(e.ctx)
+	if err != nil {
+		return nil, dialStage{}, err
+	}
+	defer release()
 	td := e.dialerFor("wsPool")
 	attempt := func(ctx context.Context, st dialStage) (net.Conn, error) {
 		raw, err := e.wsConn(ctx, mode, st, td)
@@ -769,7 +799,7 @@ func (e *bridgeEngine) dialRawWS(mode string, preferred []dialStage) (net.Conn, 
 		}
 		return enc, nil
 	}
-	return raceStages(context.Background(), methodBudget, td.order(preferred), attempt)
+	return raceStages(e.ctx, methodBudget, td.order(preferred), attempt)
 }
 
 // wsConn は、一つの道筋で WebSocket を張る。
@@ -929,7 +959,7 @@ func (e *bridgeEngine) dialWSMethod(name string, td *transportDialer, stages []d
 		}
 		return c, nil
 	}
-	c, stage, err := raceStages(context.Background(), methodBudget, stages, attempt)
+	c, stage, err := raceStages(e.ctx, methodBudget, stages, attempt)
 	if err != nil {
 		return nil, "", err
 	}
@@ -961,7 +991,7 @@ func (e *bridgeEngine) dialStreamMethod(name string, td *transportDialer, prefer
 		}
 		return c, nil
 	}
-	c, stage, err := raceStages(context.Background(), methodBudget, td.order(preferred), attempt)
+	c, stage, err := raceStages(e.ctx, methodBudget, td.order(preferred), attempt)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1077,13 +1107,17 @@ func (e *bridgeEngine) refillLoop() {
 			e.mu.Lock()
 			closed := e.closed
 			e.mu.Unlock()
-			if closed {
+			if closed || e.ctx.Err() != nil {
 				return
 			}
 			if e.pool == nil || len(e.pool) >= poolLowWater {
 				continue
 			}
 			if err := e.fillPool(poolRefillMax); err != nil {
+				// 閉じたあとの失敗は、もう知らせない。
+				if e.ctx.Err() != nil {
+					return
+				}
 				failures++
 				backoff := time.Duration(failures) * 500 * time.Millisecond
 				if backoff > 8*time.Second {
@@ -1099,6 +1133,9 @@ func (e *bridgeEngine) refillLoop() {
 }
 
 func (e *bridgeEngine) takeStream() (net.Conn, error) {
+	if err := e.ctx.Err(); err != nil {
+		return nil, err
+	}
 	select {
 	case stream := <-e.pool:
 		return stream, nil
@@ -1111,7 +1148,109 @@ func (e *bridgeEngine) takeStream() (net.Conn, error) {
 	return c, nil
 }
 
+// errHostCooling は、接続が集中した相手を休ませている間に来た接続を表す。
+// 呼び出し側では、これを記録に残さず黙って断る。
+// 休ませ始めたことと、断った件数は、ここからだけ知らせる。
+type errHostCooling struct {
+	host string
+	left time.Duration
+}
+
+func (e *errHostCooling) Error() string {
+	return fmt.Sprintf("%s is resting for %s", e.host, e.left.Round(time.Second))
+}
+
+// hostOf は、中継先の住所から相手の名前を取る。
+func hostOf(target string) string {
+	if host, _, err := net.SplitHostPort(target); err == nil {
+		return host
+	}
+	return target
+}
+
+// targetStream は、中継している一本。
+// 切られたときに、どれだけ続いたかを覚えておくために包む。
+type targetStream struct {
+	net.Conn
+	engine  *bridgeEngine
+	host    string
+	started time.Time
+	once    sync.Once
+}
+
+func (t *targetStream) Close() error {
+	t.once.Do(func() {
+		t.engine.forgetStream(t)
+		if t.engine.guard.NoteClosed(t.host, time.Since(t.started)) {
+			logf("%s への接続がすぐ切れ続けているため、しばらく中継しません（%s）", t.host, hostguard.CoolDown)
+		}
+	})
+	return t.Conn.Close()
+}
+
+// CloseWrite は、送り終えたことを中継先へ伝える。
+func (t *targetStream) CloseWrite() error {
+	if cw, ok := t.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+// trackStream は、中継している一本を覚えておく。
+func (e *bridgeEngine) trackStream(host string, c net.Conn) net.Conn {
+	st := &targetStream{Conn: c, engine: e, host: host, started: time.Now()}
+	e.streamsMu.Lock()
+	if e.streams == nil {
+		e.streams = map[*targetStream]struct{}{}
+	}
+	e.streams[st] = struct{}{}
+	e.streamsMu.Unlock()
+	return st
+}
+
+func (e *bridgeEngine) forgetStream(st *targetStream) {
+	e.streamsMu.Lock()
+	delete(e.streams, st)
+	e.streamsMu.Unlock()
+}
+
+// dialTarget は、中継の向こうの相手へ一本つなぐ。
+// 接続を閉じたあとは何も始めない。
+// 同じ相手への接続が集中している間は、流れを使わずにすぐ断る。
 func (e *bridgeEngine) dialTarget(target string) (net.Conn, error) {
+	if err := e.ctx.Err(); err != nil {
+		return nil, errors.New("bridge is closed")
+	}
+	e.mu.Lock()
+	closed := e.closed
+	e.mu.Unlock()
+	if closed {
+		return nil, errors.New("bridge is closed")
+	}
+
+	host := hostOf(target)
+	if left, ok := e.guard.Allow(host); !ok {
+		if n := e.guard.NoteRejected(host); n == 1 || n%200 == 0 {
+			logf("%s を休ませています（%s ほど）。これまでの断り %d 件", host, left.Round(time.Second), n)
+		}
+		return nil, &errHostCooling{host: host, left: left}
+	}
+	if e.guard.NoteAttempt(host) {
+		logf("%s への接続が集中したため、しばらく中継しません（%s）", host, hostguard.CoolDown)
+	}
+
+	conn, err := e.dialTargetStream(target)
+	if err != nil {
+		if e.ctx.Err() == nil && e.guard.NoteFailure(host) {
+			logf("%s へつながらない状態が続いているため、しばらく中継しません（%s）", host, hostguard.CoolDown)
+		}
+		return nil, err
+	}
+	return e.trackStream(host, conn), nil
+}
+
+// dialTargetStream は、流れか SSH の上に相手への道を作る。
+func (e *bridgeEngine) dialTargetStream(target string) (net.Conn, error) {
 	if e.pool == nil {
 		e.mu.Lock()
 		c := e.sshClient
@@ -1137,6 +1276,9 @@ func (e *bridgeEngine) dialTarget(target string) (net.Conn, error) {
 
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
+		if err := e.ctx.Err(); err != nil {
+			return nil, errors.New("bridge is closed")
+		}
 		stream, err := e.takeStream()
 		if err != nil {
 			lastErr = err
@@ -1186,11 +1328,32 @@ func (e *bridgeEngine) close() {
 	}
 	e.closed = true
 	close(e.stopCh)
+	// 進行中の張り出しを打ち切る。これが無いと、切ったあとも裏で
+	// 新しい流れを張り続けて、他の通信まで巻き添えにする。
+	if e.cancel != nil {
+		e.cancel()
+	}
+	if e.gate != nil {
+		e.gate.Close()
+	}
 	if e.sshClient != nil {
 		_ = e.sshClient.Close()
 		e.sshClient = nil
 	}
 	e.mu.Unlock()
+
+	// 中継中の一本も切る。残したままにすると通らなくなったあとも通信が残る。
+	e.streamsMu.Lock()
+	live := make([]*targetStream, 0, len(e.streams))
+	for st := range e.streams {
+		live = append(live, st)
+	}
+	e.streams = nil
+	e.streamsMu.Unlock()
+	for _, st := range live {
+		_ = st.Close()
+	}
+
 	if e.pool != nil {
 		for {
 			select {

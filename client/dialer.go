@@ -48,6 +48,13 @@ const (
 	poolRefillMax  = 4
 )
 
+const (
+	// 同時に張り出す流れの本数と、その手前で待たせる本数。
+	// 流れが尽きたときに、来た接続の数だけ一斉に張り出さないための上限。
+	dialSlots = 6
+	dialQueue = 6
+)
+
 // dialStage は、ブリッジのホストへ届くまでの一つの道筋。
 type dialStage struct {
 	port string // 代替の HTTPS ポート
@@ -426,7 +433,12 @@ func raceStages[T interface{ Close() error }](parent context.Context, budget tim
 			cancel()
 			return r.value, r.stage, true
 		}
-		errs = append(errs, r.stage.label()+": "+r.err.Error())
+		// 道筋の名前を二度繰り返さない。
+		if label := r.stage.label(); strings.HasPrefix(r.err.Error(), label) {
+			errs = append(errs, r.err.Error())
+		} else {
+			errs = append(errs, label+": "+r.err.Error())
+		}
 		if errors.Is(r.err, endpoint.ErrUnavailable) {
 			// 道筋を変えても答えは変わらないので、ここで打ち切る。
 			cancel()
