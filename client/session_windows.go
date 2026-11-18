@@ -45,6 +45,16 @@ func (s *session) connected() bool {
 	return s.eng != nil && !s.closed
 }
 
+// activeEngine は、いまつないでいる中身を返す。つないでいなければ nil。
+func (s *session) activeEngine() *bridgeEngine {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.eng == nil || s.closed {
+		return nil
+	}
+	return s.eng
+}
+
 // connect はブリッジへ接続し、ローカルの入口を開く。
 // 前回つながった経路があれば、それを先に試す。
 func (s *session) connect(serverURLs string, cached *routeCache, withSystemProxy bool, setStatus func(string)) (*routeCache, error) {
@@ -122,7 +132,7 @@ func (s *session) connect(serverURLs string, cached *routeCache, withSystemProxy
 	if eng.pool != nil {
 		pool = &bufPool256
 	}
-	go serveLocalProxy(ln, eng.dialTarget, pool)
+	go serveLocalProxy(ln, eng.dialTarget, eng.dialUDP, pool)
 
 	addr, _ := ln.Addr().(*net.TCPAddr)
 	port := 0

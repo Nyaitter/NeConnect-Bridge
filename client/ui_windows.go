@@ -849,7 +849,8 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 		procEnableWindow.Call(ui.connectBtn, boolFlag(!busy))
 		procEnableWindow.Call(ui.disconnectBtn, boolFlag(busy))
 		procEnableWindow.Call(ui.serverEdit, boolFlag(!busy))
-		procEnableWindow.Call(ui.genBtn, boolFlag(!busy))
+		// ブリッジURLの取得は、つないだままでも使える。
+		procEnableWindow.Call(ui.genBtn, boolFlag(!ui.connecting))
 		syncTarget()
 	}
 
@@ -1103,7 +1104,7 @@ func runMainWindow(cfg Config, hooks uiHooks, onQuit func()) {
 				}
 				return 0
 			case idGenBtn:
-				if !ui.connecting && !ui.connected {
+				if !ui.connecting {
 					cur := getText(ui.serverEdit)
 					goSafe("url request", func() { generateURL(cur) })
 				}
@@ -1363,13 +1364,17 @@ func (u *mainUI) takePaths() []string {
 // pickAppFile は起動するアプリを選ぶダイアログを開く。
 func pickAppFile(owner uintptr) (string, bool) {
 	var picked string
-	_ = withCOM(func() error {
+	if err := withCOM(func() error {
 		p, ok := openFileDialog(owner)
 		if ok {
 			picked = p
 		}
 		return nil
-	})
+	}); err != nil {
+		logf("アプリを選ぶ画面を開けませんでした: %v", err)
+		showError("NeConnect Bridge", "アプリを選ぶ画面を開けませんでした。")
+		return "", false
+	}
 	_ = owner
 	return picked, picked != ""
 }
