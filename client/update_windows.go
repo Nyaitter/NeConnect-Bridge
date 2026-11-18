@@ -107,10 +107,13 @@ func askRestart(text string) bool {
 
 // restartSelf は、差し替えた実行ファイルを起動して、自分は閉じる。
 func restartSelf(exe string) {
+	// 次の起動が二重起動として閉じられないよう、先に席を譲る。
+	releaseWindowInstance()
 	cmd := exec.Command(exe)
 	cmd.Dir = filepath.Dir(exe)
 	if err := cmd.Start(); err != nil {
 		logf("新しい版を起動できませんでした: %v", err)
+		takeInstance()
 		return
 	}
 	logf("新しい版を起動しました")
