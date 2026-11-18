@@ -19,6 +19,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -35,6 +36,7 @@ import (
 	"neconnectbridge/internal/rangetunnel"
 	"neconnectbridge/internal/selfupdate"
 	"neconnectbridge/internal/singleinst"
+	"neconnectbridge/internal/udpassoc"
 	"neconnectbridge/internal/wsconn"
 )
 
@@ -505,6 +507,9 @@ type bridgeEngine struct {
 	// streams は、いま中継している接続。閉じるときに一緒に切る。
 	streams   map[*targetStream]struct{}
 	streamsMu sync.Mutex
+	// udpTunnels は、いま開いている UDP のまとまり。閉じるときに一緒に切る。
+	udpTunnels   map[*udpTunnel]struct{}
+	udpTunnelsMu sync.Mutex
 }
 
 type methodKind int
@@ -832,8 +837,8 @@ func (e *bridgeEngine) dialWSStage(ctx context.Context, wsURL string, stage dial
 	}
 	d := &websocket.Dialer{
 		HandshakeTimeout:  6 * time.Second,
-		ReadBufferSize:    64 * 1024,
-		WriteBufferSize:   64 * 1024,
+		ReadBufferSize:    128 * 1024,
+		WriteBufferSize:   256 * 1024,
 		EnableCompression: false,
 		NetDialTLSContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
 			return td.dialConn(dctx, stage, port, true, []string{"http/1.1"})
@@ -1215,6 +1220,71 @@ func (e *bridgeEngine) forgetStream(st *targetStream) {
 	e.streamsMu.Unlock()
 }
 
+// errNoUDP は、この接続では UDP を運べないことを表す。
+// SSH の上を通るときは、まとまりをそのまま運ぶ道がない。
+var errNoUDP = errors.New("this connection cannot carry UDP")
+
+// udpTunnel は、UDP の一つのまとまり。
+// 閉じたときに、接続の一覧からも外れる。
+type udpTunnel struct {
+	tun    *udpassoc.Tunnel
+	engine *bridgeEngine
+	once   sync.Once
+}
+
+func (u *udpTunnel) release() {
+	u.once.Do(func() {
+		u.engine.forgetUDP(u)
+	})
+	_ = u.tun.Close()
+}
+
+func (e *bridgeEngine) forgetUDP(u *udpTunnel) {
+	e.udpTunnelsMu.Lock()
+	delete(e.udpTunnels, u)
+	e.udpTunnelsMu.Unlock()
+}
+
+// dialUDP は、UDP のまとまりを一つ開く。
+// 速いモードの流れの上だけが、宛先を添えたまとまりを運べる。
+func (e *bridgeEngine) dialUDP() (*udpTunnel, error) {
+	if err := e.ctx.Err(); err != nil {
+		return nil, errors.New("bridge is closed")
+	}
+	e.mu.Lock()
+	closed := e.closed
+	pool := e.pool
+	e.mu.Unlock()
+	if closed {
+		return nil, errors.New("bridge is closed")
+	}
+	if pool == nil {
+		return nil, errNoUDP
+	}
+	conn, _, err := e.dialRawWS("speed", nil)
+	if err != nil {
+		return nil, err
+	}
+	tun, oerr := udpassoc.Open(conn)
+	if oerr != nil {
+		_ = conn.Close()
+		return nil, oerr
+	}
+	u := &udpTunnel{tun: tun, engine: e}
+	e.udpTunnelsMu.Lock()
+	if e.udpTunnels == nil {
+		e.udpTunnels = map[*udpTunnel]struct{}{}
+	}
+	e.udpTunnels[u] = struct{}{}
+	e.udpTunnelsMu.Unlock()
+	if e.ctx.Err() != nil {
+		// 閉じたあとに開いたものは残さない。
+		u.release()
+		return nil, errors.New("bridge is closed")
+	}
+	return u, nil
+}
+
 // dialTarget は、中継の向こうの相手へ一本つなぐ。
 // 接続を閉じたあとは何も始めない。
 // 同じ相手への接続が集中している間は、流れを使わずにすぐ断る。
@@ -1355,6 +1425,18 @@ func (e *bridgeEngine) close() {
 	e.streamsMu.Unlock()
 	for _, st := range live {
 		_ = st.Close()
+	}
+
+	// UDP のまとまりも残さない。
+	e.udpTunnelsMu.Lock()
+	udpLive := make([]*udpTunnel, 0, len(e.udpTunnels))
+	for u := range e.udpTunnels {
+		udpLive = append(udpLive, u)
+	}
+	e.udpTunnels = nil
+	e.udpTunnelsMu.Unlock()
+	for _, u := range udpLive {
+		u.release()
 	}
 
 	if e.pool != nil {
@@ -1513,7 +1595,7 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 	hooks := uiHooks{}
 
 	generateURL = func(currentURLs string) {
-		generateURLImpl(dir, readCfg(), signer, currentURLs)
+		generateURLImpl(dir, readCfg(), signer, currentURLs, sess.activeEngine())
 	}
 
 	hooks.onConnect = func(serverURLs string) {
@@ -1672,13 +1754,17 @@ func runGUIMode(dir string, cfg Config, signer ssh.Signer) {
 
 			owner := globalUI.windowHandle()
 			var picked string
-			_ = withCOM(func() error {
+			if err := withCOM(func() error {
 				p, ok := pickShortcutPath(owner, defName)
 				if ok {
 					picked = p
 				}
 				return nil
-			})
+			}); err != nil {
+				logf("shortcut dialog failed: %v", err)
+				showError("NeConnect Bridge", "保存先を選ぶ画面を開けませんでした。")
+				return
+			}
 			if picked == "" {
 				return
 			}
@@ -1753,9 +1839,26 @@ func main() {
 // generateURL は画面から差し替えられる、ブリッジURLの取得処理。
 var generateURL = func(currentURLs string) {}
 
+// urlRequestBusy は、ブリッジURLの取得が続けて押されても重ならないようにする。
+var urlRequestBusy atomic.Bool
+
 // generateURLImpl はブリッジ経由で新しいブリッジURLを取りに行く。
-func generateURLImpl(dir string, cfg Config, signer ssh.Signer, currentURLs string) {
-	globalUI.setStatus("ブリッジURLをリクエスト中...")
+// すでにつないでいるときは、その接続をそのまま使う。
+func generateURLImpl(dir string, cfg Config, signer ssh.Signer, currentURLs string, active *bridgeEngine) {
+	if !urlRequestBusy.CompareAndSwap(false, true) {
+		return
+	}
+	defer urlRequestBusy.Store(false)
+
+	connected := active != nil
+	setStatus := func(text string) {
+		if connected {
+			globalUI.setStatus("接続中 — " + text)
+			return
+		}
+		globalUI.setStatus(text)
+	}
+	setStatus("ブリッジURLをリクエスト中...")
 	cands := splitServerURLs(currentURLs)
 	hasDefault := false
 	for _, c := range cands {
@@ -1813,7 +1916,19 @@ func generateURLImpl(dir string, cfg Config, signer ssh.Signer, currentURLs stri
 		return parseGenResp(body, resp.StatusCode)
 	}
 
+	// つないでいるなら、そのままの接続で取りに行く。新しく張り直さない。
+	if connected {
+		if uStr, gerr := genViaEngine(active); gerr == nil && uStr != "" {
+			generated = uStr
+		} else if gerr != nil {
+			errs = append(errs, "connected: "+gerr.Error())
+		}
+	}
+
 	for _, raw := range cands {
+		if generated != "" {
+			break
+		}
 		var httpURL string
 		var pollURL string
 		var uerr error
@@ -1873,10 +1988,21 @@ func generateURLImpl(dir string, cfg Config, signer ssh.Signer, currentURLs stri
 	}
 
 	if generated == "" {
-		globalUI.setStatus("待機中 — リクエストに失敗しました")
+		if connected {
+			globalUI.setStatus("接続中 — リクエストに失敗しました")
+		} else {
+			globalUI.setStatus("待機中 — リクエストに失敗しました")
+		}
 		showError("NeConnect Bridge", fmt.Sprintf("ブリッジURLの取得に失敗しました:\n%s", strings.Join(errs, "\n")))
 		return
 	}
 	globalUI.appendGeneratedURL(generated)
-	globalUI.setStatus("新しいブリッジURLを取得しました")
+	// つないでいる間は入力欄が読み取り専用なので、次に開いたときのために控えも更新する。
+	merged := generated
+	if rest := strings.TrimSpace(currentURLs); rest != "" {
+		merged = generated + "\n" + rest
+	}
+	cfg.ServerURL = merged
+	saveConfig(dir, cfg)
+	setStatus("新しいブリッジURLを取得しました")
 }

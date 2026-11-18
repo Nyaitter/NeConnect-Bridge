@@ -8,6 +8,8 @@ import (
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"neconnectbridge/internal/wintext"
 )
 
 var (
@@ -24,6 +26,7 @@ var (
 	procDragFinish           = shell32.NewProc("DragFinish")
 	procGetSaveFileNameW     = comdlg.NewProc("GetSaveFileNameW")
 	procGetOpenFileNameW     = comdlg.NewProc("GetOpenFileNameW")
+	procCommDlgExtendedError = comdlg.NewProc("CommDlgExtendedError")
 	procSHGetFileInfoW       = shell32.NewProc("SHGetFileInfoW")
 )
 
@@ -292,15 +295,28 @@ type openFileNameW struct {
 	FlagsEx           uint32
 }
 
+// utf16MultiString は、NUL で区切った一連の文字列を、終端付きの形にする。
+// syscall.StringToUTF16Ptr は NUL を含む文字列を受け取れないため、こちらで作る。
+func utf16MultiString(s string) *uint16 {
+	return wintext.MultiString(s)
+}
+
+// dialogErrorCode は、直前に開いた画面が閉じた理由を返す。
+// 利用者が取りやめただけのときは 0 になる。
+func dialogErrorCode() uint32 {
+	r, _, _ := procCommDlgExtendedError.Call()
+	return uint32(r)
+}
+
 // pickShortcutPath は保存先を選ぶダイアログを開き、選ばれたパスを返す。
 func pickShortcutPath(owner uintptr, defaultName string) (string, bool) {
 	buf := make([]uint16, 1024)
 	def, _ := syscall.UTF16FromString(defaultName)
 	copy(buf, def)
-	filter := syscall.StringToUTF16Ptr("ショートカット (*.lnk)\x00*.lnk\x00すべてのファイル (*.*)\x00*.*\x00\x00")
-	title := syscall.StringToUTF16Ptr("ショートカットの保存先")
-	initial := syscall.StringToUTF16Ptr(desktopPath())
-	defExt := syscall.StringToUTF16Ptr("lnk")
+	filter := utf16MultiString("ショートカット (*.lnk)\x00*.lnk\x00すべてのファイル (*.*)\x00*.*\x00\x00")
+	title := comString("ショートカットの保存先")
+	initial := comString(desktopPath())
+	defExt := comString("lnk")
 
 	var ofn openFileNameW
 	ofn.lStructSize = uint32(unsafe.Sizeof(ofn))
@@ -315,6 +331,9 @@ func pickShortcutPath(owner uintptr, defaultName string) (string, bool) {
 
 	r, _, _ := procGetSaveFileNameW.Call(uintptr(unsafe.Pointer(&ofn)))
 	if r == 0 {
+		if code := dialogErrorCode(); code != 0 {
+			logf("保存先を選ぶ画面を開けませんでした (code %d)", code)
+		}
 		return "", false
 	}
 	return syscall.UTF16ToString(buf), true
@@ -333,10 +352,10 @@ func resolveDroppedPath(path string) string {
 // openFileDialog はアプリを選ぶダイアログを開く。
 func openFileDialog(owner uintptr) (string, bool) {
 	buf := make([]uint16, 1024)
-	filter := syscall.StringToUTF16Ptr("アプリ (*.exe;*.lnk)\x00*.exe;*.lnk\x00すべてのファイル (*.*)\x00*.*\x00\x00")
-	title := syscall.StringToUTF16Ptr("起動するアプリを選択")
-	initial := syscall.StringToUTF16Ptr(desktopPath())
-	defExt := syscall.StringToUTF16Ptr("exe")
+	filter := utf16MultiString("アプリ (*.exe;*.lnk)\x00*.exe;*.lnk\x00すべてのファイル (*.*)\x00*.*\x00\x00")
+	title := comString("起動するアプリを選択")
+	initial := comString(desktopPath())
+	defExt := comString("exe")
 
 	var ofn openFileNameW
 	ofn.lStructSize = uint32(unsafe.Sizeof(ofn))
@@ -351,6 +370,9 @@ func openFileDialog(owner uintptr) (string, bool) {
 
 	r, _, _ := procGetOpenFileNameW.Call(uintptr(unsafe.Pointer(&ofn)))
 	if r == 0 {
+		if code := dialogErrorCode(); code != 0 {
+			logf("アプリを選ぶ画面を開けませんでした (code %d)", code)
+		}
 		return "", false
 	}
 	return syscall.UTF16ToString(buf), true

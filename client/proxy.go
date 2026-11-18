@@ -14,10 +14,11 @@ import (
 	"time"
 
 	"neconnectbridge/internal/relaylog"
+	"neconnectbridge/internal/udpassoc"
 )
 
 // 手元の入口。SOCKS5・SOCKS4・HTTP のどれで来ても同じ中継へ流す。
-func serveLocalProxy(ln net.Listener, dialTarget func(string) (net.Conn, error), pool *sync.Pool) {
+func serveLocalProxy(ln net.Listener, dialTarget func(string) (net.Conn, error), dialUDP func() (*udpTunnel, error), pool *sync.Pool) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -32,7 +33,7 @@ func serveLocalProxy(ln net.Listener, dialTarget func(string) (net.Conn, error),
 					logf("local connection stopped: %v", r)
 				}
 			}()
-			handleLocalConn(c, dialTarget, pool)
+			handleLocalConn(c, dialTarget, dialUDP, pool)
 		}(conn)
 	}
 }
@@ -53,7 +54,7 @@ func (b *bufferedConn) CloseWrite() error {
 }
 
 // handleLocalConn は先頭の1バイトで種類を見分ける。
-func handleLocalConn(c net.Conn, dialTarget func(string) (net.Conn, error), pool *sync.Pool) {
+func handleLocalConn(c net.Conn, dialTarget func(string) (net.Conn, error), dialUDP func() (*udpTunnel, error), pool *sync.Pool) {
 	defer c.Close()
 	// 何も送ってこない相手につながったままにしない。
 	_ = c.SetDeadline(time.Now().Add(30 * time.Second))
@@ -66,7 +67,7 @@ func handleLocalConn(c net.Conn, dialTarget func(string) (net.Conn, error), pool
 	wrapped := &bufferedConn{Conn: c, r: br}
 	switch first[0] {
 	case 0x05:
-		handleSOCKS5(wrapped, dialTarget, pool)
+		handleSOCKS5(wrapped, dialTarget, dialUDP, pool)
 	case 0x04:
 		handleSOCKS4(wrapped, dialTarget, pool)
 	default:
@@ -80,7 +81,7 @@ func relay(label string, browser, remote net.Conn, pool *sync.Pool) {
 	relaylog.Relay(label, browser, remote, pool, logf)
 }
 
-func handleSOCKS5(c net.Conn, dialTarget func(string) (net.Conn, error), pool *sync.Pool) {
+func handleSOCKS5(c net.Conn, dialTarget func(string) (net.Conn, error), dialUDP func() (*udpTunnel, error), pool *sync.Pool) {
 	hdr := make([]byte, 2)
 	if _, err := io.ReadFull(c, hdr); err != nil || hdr[0] != 0x05 {
 		return
@@ -97,7 +98,8 @@ func handleSOCKS5(c net.Conn, dialTarget func(string) (net.Conn, error), pool *s
 	if _, err := io.ReadFull(c, req); err != nil {
 		return
 	}
-	if req[0] != 0x05 || req[1] != 0x01 {
+	// 1 は普通の接続、3 は UDP のまとまり。
+	if req[0] != 0x05 || (req[1] != 0x01 && req[1] != 0x03) {
 		_, _ = c.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
@@ -138,6 +140,11 @@ func handleSOCKS5(c net.Conn, dialTarget func(string) (net.Conn, error), pool *s
 	port := binary.BigEndian.Uint16(pb)
 	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
+	if req[1] == 0x03 {
+		serveUDPAssociate(c, dialUDP)
+		return
+	}
+
 	// 広告の配信元なら、中継へ流さずここで断る。
 	if shouldBlockHost(host) {
 		noteAdBlockHit(host)
@@ -160,6 +167,46 @@ func handleSOCKS5(c net.Conn, dialTarget func(string) (net.Conn, error), pool *s
 	}
 	_ = c.SetDeadline(time.Time{})
 	relay("SOCKS5 "+target, c, remote, pool)
+}
+
+// serveUDPAssociate は、SOCKS5 の UDP のまとまりを受ける。
+// ブラウザの WebRTC のように、一つの入口から複数の相手へ投げる通信も、
+// ここから先は宛先ごとに分けて中継する。
+func serveUDPAssociate(c net.Conn, dialUDP func() (*udpTunnel, error)) {
+	if dialUDP == nil {
+		_, _ = c.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	_ = c.SetDeadline(time.Now().Add(20 * time.Second))
+	tun, err := dialUDP()
+	if err != nil {
+		if !quietDialError(err) && !errors.Is(err, errNoUDP) {
+			logf("UDP ASSOCIATE failed: %v", err)
+		}
+		_, _ = c.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	defer tun.release()
+
+	local, lerr := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if lerr != nil {
+		logf("UDP ASSOCIATE: 入口を確保できませんでした: %v", lerr)
+		_, _ = c.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	addr := local.LocalAddr().(*net.UDPAddr)
+	reply := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, byte(addr.Port >> 8), byte(addr.Port)}
+	_ = c.SetDeadline(time.Time{})
+	if _, werr := c.Write(reply); werr != nil {
+		_ = local.Close()
+		return
+	}
+	logf("UDP ASSOCIATE 127.0.0.1:%d", addr.Port)
+	_ = udpassoc.Run(c, tun.tun, local, udpassoc.Options{
+		Blocked: shouldBlockHost,
+		Logf:    logf,
+	})
+	logf("UDP ASSOCIATE closed 127.0.0.1:%d", addr.Port)
 }
 
 // handleSOCKS4 は SOCKS4 と SOCKS4a を受ける。

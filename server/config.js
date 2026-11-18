@@ -50,6 +50,8 @@ function loadConfig(argv) {
     'releases': 'string',
     'max-clients': 'string',
     'data-dir': 'string',
+    // 試験用。自分の場所（ループバックや内部向け）へも UDP を送れるようにする。
+    'udp-allow-local': 'boolean',
     'auth-api': 'string',
     'auth-app-id': 'string',
     'auth-token': 'string',
@@ -72,6 +74,7 @@ function loadConfig(argv) {
     releasesDir: path.resolve(flags.releases || process.env.NCTB_RELEASES || path.join(dataDir, 'releases')),
     clientVersion: readPackageVersion(),
     maxClients: Number(flags['max-clients'] || process.env.NCTB_MAX_CLIENTS || 5),
+    udpAllowLocal: Boolean(flags['udp-allow-local']) || process.env.NCTB_UDP_ALLOW_LOCAL === '1',
     authApi: (flags['auth-api'] || process.env.NCTB_AUTH_API || '').replace(/\/+$/, ''),
     authAppId: flags['auth-app-id'] || process.env.NCTB_AUTH_APP_ID || 'neconnect-bridge',
     authToken: (flags['auth-token'] || process.env.NCTB_AUTH_TOKEN || '').trim(),

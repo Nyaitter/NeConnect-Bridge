@@ -42,17 +42,18 @@ const (
 
 const (
 	// つなぐ準備として張っておく流れの数と、張り足す目安。
-	poolSize       = 12
-	poolLowWater   = 10
+	// 使っていない間は寝ているだけなので、厚めに持っておく。
+	poolSize       = 24
+	poolLowWater   = 20
 	poolWarmBudget = 6 * time.Second
-	poolRefillMax  = 4
+	poolRefillMax  = 8
 )
 
 const (
 	// 同時に張り出す流れの本数と、その手前で待たせる本数。
 	// 流れが尽きたときに、来た接続の数だけ一斉に張り出さないための上限。
-	dialSlots = 6
-	dialQueue = 6
+	dialSlots = 12
+	dialQueue = 16
 )
 
 // dialStage は、ブリッジのホストへ届くまでの一つの道筋。

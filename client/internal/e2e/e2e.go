@@ -66,7 +66,14 @@ type aeadConn struct {
 	rSeq   uint64
 	wSeq   uint64
 	rPlain []byte
+	// 復号と暗号化の置き場所は、毎回作らずに使う。
+	rBox []byte
+	rCt  []byte
+	wBox []byte
 }
+
+// writeChunk は、一度に暗号化する量。
+const writeChunk = 128 * 1024
 
 func makeNonce(seq uint64) []byte {
 	var n [12]byte
@@ -86,12 +93,18 @@ func (a *aeadConn) Read(p []byte) (int, error) {
 		if clen <= 0 || clen > 512*1024 {
 			return 0, errors.New("invalid e2e frame length")
 		}
-		ct := make([]byte, clen)
+		if cap(a.rCt) < clen {
+			a.rCt = make([]byte, clen)
+		}
+		ct := a.rCt[:clen]
 		if _, err := io.ReadFull(a.Conn, ct); err != nil {
 			return 0, err
 		}
 		a.rSeq++
-		plain, err := a.rAEAD.Open(nil, makeNonce(a.rSeq), ct, nil)
+		if cap(a.rBox) < clen {
+			a.rBox = make([]byte, clen)
+		}
+		plain, err := a.rAEAD.Open(a.rBox[:0], makeNonce(a.rSeq), ct, nil)
 		if err != nil {
 			return 0, errors.New("e2e authentication failed")
 		}
@@ -108,14 +121,17 @@ func (a *aeadConn) Write(p []byte) (int, error) {
 	total := 0
 	for len(p) > 0 {
 		chunk := p
-		if len(chunk) > 64*1024 {
-			chunk = p[:64*1024]
+		if len(chunk) > writeChunk {
+			chunk = p[:writeChunk]
 		}
+		need := 4 + len(chunk) + a.wAEAD.Overhead()
+		if cap(a.wBox) < need {
+			a.wBox = make([]byte, need)
+		}
+		pkt := a.wBox[:need]
 		a.wSeq++
-		ct := a.wAEAD.Seal(nil, makeNonce(a.wSeq), chunk, nil)
-		pkt := make([]byte, 4+len(ct))
+		ct := a.wAEAD.Seal(pkt[4:4], makeNonce(a.wSeq), chunk, nil)
 		binary.BigEndian.PutUint32(pkt[:4], uint32(len(ct)))
-		copy(pkt[4:], ct)
 		if _, err := a.Conn.Write(pkt); err != nil {
 			return total, err
 		}

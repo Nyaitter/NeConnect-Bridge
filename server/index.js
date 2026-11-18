@@ -15,6 +15,7 @@ const { Auth, randomURLSafe } = require('./auth');
 const { TunnelManager } = require('./tunnels');
 const { TunnelPipe } = require('./tunnelpipe');
 const { acceptFakeHandshake, PeekSocket } = require('./tlsmask');
+const { UdpRelay, UDP_REQUEST, isPrivateAddress } = require('./udp');
 const {
   joinStreams,
   readExactly,
@@ -130,12 +131,52 @@ async function bridgeToLocalSsh(stream, tag) {
   }
 }
 
+// UDP のまとまりを一度に受け持つ数。使い終わればすぐに空きへ戻す。
+const MAX_UDP_ASSOCIATIONS = 256;
+let udpAssociations = 0;
+
+function handleUdpAssociation(stream) {
+  if (udpAssociations >= MAX_UDP_ASSOCIATIONS) {
+    log('[udp] refused: too many associations');
+    try {
+      stream.write(Buffer.from([2]));
+    } catch {
+      // すでに切れている
+    }
+    stream.destroy();
+    return;
+  }
+  udpAssociations += 1;
+  try {
+    stream.write(Buffer.from([0]));
+  } catch {
+    udpAssociations -= 1;
+    stream.destroy();
+    return;
+  }
+  log(`[udp] association open (${udpAssociations} in use)`);
+  const relay = new UdpRelay(stream, {
+    log,
+    // 自分の場所へは送らない。試験のときだけ開けられる。
+    blocked: config.udpAllowLocal ? () => false : isPrivateAddress,
+  });
+  stream.once('close', () => {
+    udpAssociations -= 1;
+  });
+  relay.start();
+}
+
 async function handleStream(stream, highSpeed) {
   let remote;
   let target = '';
   try {
     const header = await readExactly(stream, 2);
-    const length = header.readUInt16BE(0);
+    const raw = header.readUInt16BE(0);
+    if (raw & UDP_REQUEST) {
+      handleUdpAssociation(stream);
+      return;
+    }
+    const length = raw;
     if (length <= 0 || length > 1024) throw new Error('invalid target frame');
     target = (await readExactly(stream, length)).toString('utf8');
     remote = await connect(target, 10000);
